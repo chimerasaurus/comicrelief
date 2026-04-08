@@ -13,6 +13,7 @@ Comic readers like Komga, Kavita, and YACReader rely on embedded metadata to dis
 - Python 3.9+
 - A free [Comic Vine API key](https://comicvine.gamespot.com/api/)
 - For CBR support: `brew install libarchive` (macOS) or `apt install libarchive-tools` (Linux)
+- For smart cover matching (installed automatically via requirements.txt): `Pillow` and `imagehash`
 
 ---
 
@@ -29,6 +30,8 @@ pip install -r requirements.txt
 requests>=2.31.0
 rich>=13.7.0
 rarfile>=4.1
+Pillow>=10.0.0
+imagehash>=4.3.1
 ```
 
 ---
@@ -77,6 +80,7 @@ python3 comicrelief.py [OPTIONS] <path>
 | `--dry-run` | Show proposed changes without writing anything (works with all modes) |
 | `--no-rename` | Fix embedded metadata only, do not rename files |
 | `--no-cache` | Ignore cached API results and re-fetch from Comic Vine |
+| `--smart-match` | Use cover image comparison to disambiguate series with similar names |
 | `--api-key KEY` | Comic Vine API key (overrides env var and saved config) |
 | `--cache-file FILE` | Path to JSON cache file (default: `~/.comicrelief_cache.json`) |
 | `--core-fields FIELDS` | Comma-separated fields that must all be present for a ✓ in `--list` mode. Default: `Number,Publisher,Series,Year` |
@@ -251,7 +255,19 @@ When searching for a series, results are scored and ranked by:
 
 API results are cached to `~/.comicrelief_cache.json` to avoid redundant requests when running over a large library. Use `--no-cache` to bypass this.
 
-### 4. Confirmation UI
+### 4. Smart cover matching
+
+When Comic Vine returns multiple candidate series with the same or similar name (e.g. "Star Trek: Deep Space Nine" published by both Marvel and Malibu in 1993), the script extracts the cover image from the comic file and compares it against the issue cover from each candidate on Comic Vine using **perceptual hashing (pHash)**.
+
+pHash converts an image into a 64-bit fingerprint that is robust to resizing, minor colour differences, and JPEG artefacts. The Hamming distance between two hashes indicates how similar they are (0 = identical, 64 = completely different). The candidate with the lowest distance wins.
+
+If the best distance is above the confidence threshold (indicating no good visual match — e.g. the issue has no cover on Comic Vine, or the scan is too different from the reference), the script falls back to the score-based result.
+
+When smart matching is used, the metadata source is shown as **Comic Vine (smart match)** in the confirmation UI.
+
+Smart matching is **opt-in** — pass `--smart-match` to enable it. It requires `Pillow` and `imagehash` (both included in `requirements.txt`). If they are not installed, or if the cover image cannot be decoded, the script falls back to score-based matching without any error.
+
+### 5. Confirmation UI
 
 For each file, a two-column table is displayed showing current vs proposed metadata. Changed fields are highlighted in green, removed fields in red:
 
@@ -303,7 +319,7 @@ No changes detected.
 | `i` | Enter a Comic Vine volume ID directly |
 | `q` | Quit |
 
-### 5. Picking the right series
+### 6. Picking the right series
 
 If the auto-scored match doesn't look right, press `s` or `n` to search for a different series name. The script queries Comic Vine and shows all results in a numbered picker:
 
@@ -322,7 +338,7 @@ The chosen series sticks for all remaining files in the same run — you only ne
 
 Alternatively, look up the series ID on Comic Vine (`comicvine.gamespot.com/…/4050-**ID**/`) and press `i` to enter it directly, or pass `--volume-id ID` on the command line.
 
-### 6. Multiple issues with the same number
+### 7. Multiple issues with the same number
 
 Some series have more than one issue with the same number (e.g. a regular edition and a variant language edition). When this happens, a picker is shown before the confirmation table:
 
@@ -336,7 +352,7 @@ Multiple issues found with this number — please choose:
 Enter number [1/2] (1):
 ```
 
-### 7. Writing changes
+### 8. Writing changes
 
 Changes are written atomically — the script builds the updated archive in a temporary file and swaps it into place, so a crash mid-write won't corrupt your file.
 
@@ -348,7 +364,7 @@ Series Name (Year) #001 - Issue Title.cbz   ← when the issue has a title
 
 Use `--no-rename` to skip renaming and only update the embedded metadata.
 
-### 8. CBR files
+### 9. CBR files
 
 CBR files (RAR archives) cannot have their contents rewritten in-place because the RAR format is proprietary. When a CBR is encountered, the script offers to convert it to CBZ first:
 
@@ -368,7 +384,7 @@ The script auto-detects available extraction tools in this order:
 
 On macOS with Homebrew, `brew install libarchive` is the easiest option.
 
-### 9. Volume inconsistency detection
+### 10. Volume inconsistency detection
 
 The `--list` table highlights the **Vol** column in yellow when a value looks suspicious:
 

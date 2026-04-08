@@ -17,6 +17,7 @@ Options:
 """
 
 import argparse
+import io
 import json
 import warnings
 warnings.filterwarnings("ignore")  # suppress urllib3/ssl noise on macOS system Python
@@ -522,6 +523,37 @@ def search_comicvine_volumes_all(series_name: str, api_key: str) -> list:
     return data.get("results", [])
 
 
+ENGLISH_PUBLISHERS = {
+    "dc comics", "marvel", "image comics", "dark horse comics", "idw publishing",
+    "boom! studios", "dynamite entertainment", "vertigo", "wildstorm", "valiant",
+    "archie comics", "oni press", "titan comics", "aftershock", "antarctic press",
+}
+
+
+def _score_volume(v: dict, series_name: str, year: Optional[str]) -> int:
+    """Score a Comic Vine volume candidate for relevance to a series search."""
+    s = 0
+    vname = v.get("name", "").lower()
+    if vname == series_name.lower():
+        s += 10
+    elif series_name.lower() in vname:
+        s += 5
+    if year and v.get("start_year") == year:
+        s += 8
+    count = v.get("count_of_issues") or 0
+    if count > 100:
+        s += 4
+    elif count > 20:
+        s += 2
+    elif count > 5:
+        s += 1
+    pub = v.get("publisher") or {}
+    pub_name = (pub.get("name", "") if isinstance(pub, dict) else str(pub)).lower()
+    if pub_name in ENGLISH_PUBLISHERS:
+        s += 12
+    return s
+
+
 def search_comicvine_volume(series_name: str, year: Optional[str], api_key: str, cache: DiskCache, skip_cache: bool = False) -> Optional[dict]:
     """Search for a volume (series) on Comic Vine. Returns the best matching volume dict."""
     cache_key = f"cv_vol:{series_name.lower()}:{year or ''}"
@@ -549,38 +581,7 @@ def search_comicvine_volume(series_name: str, year: Optional[str], api_key: str,
         cache.set(cache_key, None)
         return None
 
-    # Score candidates: exact name match + year match + issue count + English publisher
-    ENGLISH_PUBLISHERS = {
-        "dc comics", "marvel", "image comics", "dark horse comics", "idw publishing",
-        "boom! studios", "dynamite entertainment", "vertigo", "wildstorm", "valiant",
-        "archie comics", "oni press", "titan comics", "aftershock", "antarctic press",
-    }
-
-    def score(v):
-        s = 0
-        vname = v.get("name", "").lower()
-        if vname == series_name.lower():
-            s += 10
-        elif series_name.lower() in vname:
-            s += 5
-        if year and v.get("start_year") == year:
-            s += 8
-        # Prefer volumes with more issues (likely the main run)
-        count = v.get("count_of_issues") or 0
-        if count > 100:
-            s += 4
-        elif count > 20:
-            s += 2
-        elif count > 5:
-            s += 1
-        # Strongly prefer known English publishers
-        pub = v.get("publisher") or {}
-        pub_name = (pub.get("name", "") if isinstance(pub, dict) else str(pub)).lower()
-        if pub_name in ENGLISH_PUBLISHERS:
-            s += 12
-        return s
-
-    best = max(results, key=score)
+    best = max(results, key=lambda v: _score_volume(v, series_name, year))
     cache.set(cache_key, best)
     return best
 
@@ -880,6 +881,207 @@ def search_metron(series_name: str, issue_number: Optional[str], year: Optional[
 
 
 # ---------------------------------------------------------------------------
+# Smart cover matching (perceptual hash)
+# ---------------------------------------------------------------------------
+
+def extract_cover_image(path: Path) -> Optional[bytes]:
+    """
+    Extract the first image from a CBZ archive (the cover page).
+    Returns raw image bytes, or None if extraction fails or format is not CBZ.
+    """
+    if path.suffix.lower() != ".cbz":
+        return None
+    try:
+        with zipfile.ZipFile(path) as zf:
+            image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.tiff', '.bmp')
+            image_names = sorted([
+                n for n in zf.namelist()
+                if n.lower().endswith(image_exts)
+                and '__MACOSX' not in n
+                and not os.path.basename(n).startswith('.')
+            ])
+            if image_names:
+                return zf.read(image_names[0])
+    except Exception:
+        pass
+    return None
+
+
+def _compute_phash(image_bytes: bytes) -> Optional[object]:
+    """
+    Compute a perceptual hash of image bytes.
+    Returns an imagehash.ImageHash, or None if PIL/imagehash are unavailable
+    or the image cannot be decoded.
+    """
+    try:
+        from PIL import Image
+        import imagehash
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        return imagehash.phash(img)
+    except Exception:
+        return None
+
+
+def _download_phash(url: str) -> Optional[object]:
+    """Download an image from a URL and return its perceptual hash, or None on failure."""
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "comicrelief/1.0"})
+        if resp.status_code == 200:
+            return _compute_phash(resp.content)
+    except Exception:
+        pass
+    return None
+
+
+def _get_issue_cover_url(volume_id: int, issue_number: str, api_key: str) -> Optional[str]:
+    """
+    Fetch a Comic Vine issue's cover image URL using a lightweight API call
+    (only requests id, issue_number, and image fields). Used during smart matching.
+    Returns the medium_url (or small_url as fallback), or None.
+    """
+    normalized = (
+        str(int(float(issue_number)))
+        if issue_number.replace(".", "").isdigit()
+        else issue_number
+    )
+    data = _cv_get(
+        COMICVINE_ISSUES_URL,
+        {
+            "filter": f"volume:{volume_id},issue_number:{normalized}",
+            "field_list": "id,issue_number,image",
+            "limit": 1,
+        },
+        api_key,
+    )
+    if not data or data.get("status_code") != 1:
+        return None
+    results = data.get("results", [])
+    if not results:
+        return None
+    image = results[0].get("image") or {}
+    return image.get("medium_url") or image.get("small_url")
+
+
+def _get_cv_candidates(
+    series_name: str,
+    year: Optional[str],
+    api_key: str,
+    cache: "DiskCache",
+    skip_cache: bool = False,
+    n: int = 5,
+) -> list:
+    """
+    Search Comic Vine and return the top-N scored candidate volumes.
+    Uses its own cache key so it doesn't interfere with the single-best cache
+    used by search_comicvine_volume.
+    """
+    cache_key = f"cv_vol_list:{series_name.lower()}:{year or ''}"
+    if not skip_cache:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    data = _cv_get(
+        COMICVINE_SEARCH_URL,
+        {
+            "query": series_name,
+            "resources": "volume",
+            "field_list": "id,name,start_year,publisher,count_of_issues",
+            "limit": 15,
+        },
+        api_key,
+    )
+    if not data or data.get("status_code") != 1:
+        cache.set(cache_key, [])
+        return []
+
+    results = data.get("results", [])
+    if not results:
+        cache.set(cache_key, [])
+        return []
+
+    scored = sorted(results, key=lambda v: _score_volume(v, series_name, year), reverse=True)
+    top = scored[:n]
+    cache.set(cache_key, top)
+    return top
+
+
+def smart_match_volume(
+    candidates: list,
+    issue_number: Optional[str],
+    cover_bytes: Optional[bytes],
+    api_key: str,
+) -> Optional[dict]:
+    """
+    Given multiple candidate Comic Vine volumes and the comic's cover image bytes,
+    download the issue cover from each candidate and use perceptual hashing to
+    pick the visually closest match.
+
+    Returns the best-matching volume dict, or None if matching is inconclusive
+    (PIL/imagehash unavailable, no covers found, or all distances too high).
+    """
+    if not cover_bytes or not issue_number or len(candidates) < 2:
+        return None
+
+    cover_hash = _compute_phash(cover_bytes)
+    if cover_hash is None:
+        # PIL/imagehash not installed, or cover image unreadable — degrade gracefully
+        return None
+
+    console.print(f"  [dim]Smart matching: comparing cover image against {len(candidates)} candidates…[/dim]")
+
+    MATCH_THRESHOLD = 40  # pHash distances: 0=identical, 64=max. >40 = probably no match.
+    CONFIDENT_THRESHOLD = 15  # < 15 = high confidence
+
+    best_vol: Optional[dict] = None
+    best_distance: int = 999
+    results_log: list = []
+
+    for vol in candidates:
+        vol_id = vol.get("id")
+        if not vol_id:
+            continue
+        pub = (vol.get("publisher") or {}).get("name", "?")
+        label = f"{vol.get('name', '?')} ({vol.get('start_year', '?')}, {pub})"
+
+        cover_url = _get_issue_cover_url(vol_id, issue_number, api_key)
+        if not cover_url:
+            results_log.append(f"    [dim]{label}: no cover available[/dim]")
+            continue
+
+        candidate_hash = _download_phash(cover_url)
+        if candidate_hash is None:
+            results_log.append(f"    [dim]{label}: could not fetch cover[/dim]")
+            continue
+
+        distance = cover_hash - candidate_hash  # imagehash hamming distance
+        similarity_pct = max(0, 100 - int(distance / 64.0 * 100))
+        results_log.append(
+            f"    [dim]{label}: {similarity_pct}% match (distance={distance})[/dim]"
+        )
+
+        if distance < best_distance:
+            best_distance = distance
+            best_vol = vol
+
+    for line in results_log:
+        console.print(line)
+
+    if best_vol is None or best_distance > MATCH_THRESHOLD:
+        console.print("  [dim]Smart match inconclusive — using score-based result.[/dim]")
+        return None
+
+    pub = (best_vol.get("publisher") or {}).get("name", "?")
+    confidence = "high confidence" if best_distance <= CONFIDENT_THRESHOLD else "best available"
+    console.print(
+        f"  [green]Smart match ({confidence}):[/green] "
+        f"{best_vol.get('name')} ({best_vol.get('start_year')}, {pub}) "
+        f"— distance {best_distance}/64"
+    )
+    return best_vol
+
+
+# ---------------------------------------------------------------------------
 # Metadata lookup orchestration
 # ---------------------------------------------------------------------------
 
@@ -926,12 +1128,17 @@ def fetch_comicvine_volume_by_id(volume_id: int, api_key: str, cache: DiskCache)
 def fetch_metadata(
     inferred: dict,
     api_key: Optional[str],
-    cache: DiskCache,
+    cache: "DiskCache",
     skip_cache: bool = False,
     volume_override: Optional[dict] = None,  # pre-selected Comic Vine volume dict
+    cover_bytes: Optional[bytes] = None,      # raw cover image for smart matching
 ) -> Tuple[Optional[dict], str]:
     """
     Fetch metadata from Comic Vine (primary) or Metron (fallback).
+
+    When cover_bytes is provided and multiple candidate series exist, smart cover
+    matching is used to pick the best series match via perceptual hash comparison.
+
     Returns (metadata_dict, source_label) or (None, "not found").
     """
     issue_num = inferred.get("Number")
@@ -954,14 +1161,29 @@ def fetch_metadata(
 
     # --- Comic Vine ---
     if api_key:
-        volume = search_comicvine_volume(search_name, year, api_key, cache, skip_cache=skip_cache)
+        # Get the top-N scored candidates for smart matching
+        candidates = _get_cv_candidates(search_name, year, api_key, cache, skip_cache=skip_cache)
+
+        volume: Optional[dict] = None
+
+        if len(candidates) >= 2 and cover_bytes and issue_num:
+            # Smart matching: compare cover image against each candidate's issue cover
+            volume = smart_match_volume(candidates, issue_num, cover_bytes, api_key)
+
+        if volume is None:
+            # Fall back to the top score-based candidate
+            volume = candidates[0] if candidates else None
+            if volume is None:
+                volume = search_comicvine_volume(search_name, year, api_key, cache, skip_cache=skip_cache)
+
         if volume:
             vol_id = volume.get("id")
             issue = None
             if vol_id and issue_num:
                 issue = fetch_comicvine_issue(vol_id, issue_num, api_key, cache, skip_cache=skip_cache)
             meta = extract_cv_metadata(volume, issue)
-            return meta, "Comic Vine"
+            source = "Comic Vine (smart match)" if len(candidates) >= 2 and cover_bytes else "Comic Vine"
+            return meta, source
 
     # --- Metron fallback ---
     meta = search_metron(search_name, issue_num, year, cache)
@@ -1189,6 +1411,7 @@ def process_file(
     no_rename: bool,
     no_cache: bool = False,
     auto: bool = False,
+    smart_match: bool = False,
     changelog: Optional[List] = None,
     volume_overrides: Optional[dict] = None,  # series_key → Comic Vine volume dict
 ) -> str:
@@ -1224,6 +1447,9 @@ def process_file(
     # Merge: existing metadata takes priority over filename inference
     inferred = {**filename_inferred, **current_meta}
 
+    # --- Extract cover image for smart matching (only when enabled) ---
+    cover_bytes: Optional[bytes] = extract_cover_image(path) if smart_match else None
+
     # --- Fetch from API (loop allows re-search / ID override) ---
     skip_cache = no_cache
     series_key = slugify_series(inferred.get("Series", "")).lower()
@@ -1236,6 +1462,7 @@ def process_file(
             inferred, api_key, cache,
             skip_cache=skip_cache,
             volume_override=active_volume,
+            cover_bytes=cover_bytes,
         )
         if proposed_meta is None:
             console.print(f"[yellow]Could not find metadata for:[/yellow] {path.name} (series: {inferred.get('Series', '?')})")
@@ -1809,6 +2036,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Show changes without writing")
     parser.add_argument("--no-rename", action="store_true", help="Do not rename files")
     parser.add_argument("--no-cache", action="store_true", help="Ignore cached API results and re-fetch")
+    parser.add_argument("--smart-match", action="store_true", help="Use cover image comparison to disambiguate series with similar names (requires Pillow and imagehash)")
     parser.add_argument("--api-key", help="Comic Vine API key")
     parser.add_argument("--cache-file", default=str(DEFAULT_CACHE_PATH), help="Path to API cache JSON file")
     parser.add_argument(
@@ -1956,6 +2184,7 @@ def main() -> None:
                 no_rename=args.no_rename,
                 no_cache=args.no_cache,
                 auto=args.auto,
+                smart_match=args.smart_match,
                 changelog=changelog,
                 volume_overrides=volume_overrides,
             )
