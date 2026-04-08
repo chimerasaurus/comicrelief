@@ -61,11 +61,20 @@ python3 comicrelief.py [OPTIONS] <path>
 
 `<path>` can be a **directory** (scanned recursively) or a **single file**.
 
+### Modes (mutually exclusive)
+
+| Flag | Description |
+|---|---|
+| _(none)_ | Interactive mode — confirm each file before applying |
+| `--list` | Display a metadata summary table for all files; no changes made |
+| `--convert-cbr` | Convert all CBR files to CBZ without touching metadata |
+| `--auto` | Apply all changes without per-file prompts; print a change log at the end |
+
 ### Options
 
 | Option | Description |
 |---|---|
-| `--dry-run` | Show proposed changes without writing anything |
+| `--dry-run` | Show proposed changes without writing anything (works with all modes) |
 | `--no-rename` | Fix embedded metadata only, do not rename files |
 | `--no-cache` | Ignore cached API results and re-fetch from Comic Vine |
 | `--api-key KEY` | Comic Vine API key (overrides env var and saved config) |
@@ -75,16 +84,42 @@ python3 comicrelief.py [OPTIONS] <path>
 
 ## Examples
 
+### Inspect a folder — see what needs fixing
+
+```bash
+python3 comicrelief.py --list "/Volumes/library/Fiction/Comics/Star.Trek.Starfleet.Academy.(1996)"
+```
+
+Displays a table of every file's current embedded metadata with a ✓/✗ health indicator. A ✗ means one or more core fields (Series, Number, Year, Publisher) are missing. No files are modified.
+
+```
+╭───┬──────────────────────────────────┬─────┬──────────────────────────┬───┬─────┬──────┬───────────┬──────────┬───────╮
+│   │ File                             │ Fmt │ Series                   │ # │ Vol │ Year │ Publisher │ Writer   │ Pages │
+├───┼──────────────────────────────────┼─────┼──────────────────────────┼───┼─────┼──────┼───────────┼──────────┼───────┤
+│ ✓ │ Star_Trek-SFA.issue-001.cbz      │ CBZ │ Star Trek: Starfl…       │ 1 │ 1   │ 1996 │ Marvel    │ —        │ 30    │
+│ ✗ │ Star_Trek-SFA.issue-002.cbz      │ CBZ │ —                        │ — │ —   │ —    │ —         │ —        │ —     │
+│ ✗ │ Star_Trek-SFA.issue-003.cbr      │ CBR │ Star Trek SFA            │ 3 │ —   │ —    │ —         │ —        │ 28    │
+╰───┴──────────────────────────────────┴─────┴──────────────────────────┴───┴─────┴──────┴───────────┴──────────┴───────╯
+
+3 file(s)  ✓ 1 complete   ✗ 2 missing core fields (Series / Number / Year / Publisher)
+```
+
+### Fix an entire comics library (interactive)
+
+```bash
+python3 comicrelief.py "/Volumes/library/Fiction/Comics"
+```
+
+### Fix a single series folder
+
+```bash
+python3 comicrelief.py "/Volumes/library/Fiction/Comics/Star.Trek.Starfleet.Academy.(1996)"
+```
+
 ### Preview changes without modifying any files
 
 ```bash
 python3 comicrelief.py --dry-run "/Volumes/library/Fiction/Comics"
-```
-
-### Fix an entire comics library
-
-```bash
-python3 comicrelief.py "/Volumes/library/Fiction/Comics"
 ```
 
 ### Fix a single series folder
@@ -111,6 +146,34 @@ Useful if a previous run cached a wrong match (e.g. picked the wrong issue from 
 
 ```bash
 python3 comicrelief.py --no-cache "/Volumes/library/Fiction/Comics/Batman.001.cbz"
+```
+
+### Apply all changes automatically — no prompts
+
+For when you trust the script to pick the right match. Processes everything silently and prints a full change log at the end.
+
+```bash
+python3 comicrelief.py --auto "/Volumes/library/Fiction/Comics/Star.Trek.Starfleet.Academy.(1996)"
+```
+
+You can preview what auto mode *would* do without writing anything:
+
+```bash
+python3 comicrelief.py --auto --dry-run "/Volumes/library/Fiction/Comics"
+```
+
+### Bulk-convert all CBR files to CBZ
+
+Converts the container format only — no image re-encoding, no metadata changes.
+
+```bash
+python3 comicrelief.py --convert-cbr "/Volumes/library/Fiction/Comics"
+```
+
+Preview which files would be converted:
+
+```bash
+python3 comicrelief.py --convert-cbr --dry-run "/Volumes/library/Fiction/Comics"
 ```
 
 ---

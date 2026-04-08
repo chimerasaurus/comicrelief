@@ -941,30 +941,43 @@ def show_confirmation_ui(
 # File renaming
 # ---------------------------------------------------------------------------
 
+def _safe_filename_part(text: str) -> str:
+    """Strip characters that are unsafe in filenames."""
+    # Remove or replace characters not allowed in most filesystems
+    text = re.sub(r'[\\/*?:"<>|]', "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def canonical_filename(metadata: dict, original_path: Path) -> str:
     """
-    Build a canonical filename like: Series Name (Year) #001.cbz
+    Build a canonical filename like:
+      Series Name (Year) #001.cbz
+      Series Name (Year) #001 - Issue Title.cbz   (when Title is set)
     Falls back gracefully if fields are missing.
     """
     series = metadata.get("Series", "").strip()
-    year = metadata.get("Year", "").strip()
+    year   = metadata.get("Year",   "").strip()
     number = metadata.get("Number", "").strip()
+    title  = metadata.get("Title",  "").strip()
 
     if not series:
         return original_path.name
 
-    parts = [series]
+    name = series
     if year:
-        parts[0] += f" ({year})"
+        name += f" ({year})"
     if number:
         try:
             num_int = int(float(number))
-            parts.append(f"#{num_int:03d}")
+            name += f" #{num_int:03d}"
         except ValueError:
-            parts.append(f"#{number}")
+            name += f" #{number}"
+    if title:
+        name += f" - {_safe_filename_part(title)}"
 
     ext = original_path.suffix.lower()
-    return " ".join(parts) + ext
+    return name + ext
 
 
 def rename_file(path: Path, metadata: dict, dry_run: bool) -> Path:
@@ -1004,6 +1017,8 @@ def process_file(
     dry_run: bool,
     no_rename: bool,
     no_cache: bool = False,
+    auto: bool = False,
+    changelog: Optional[List] = None,
 ) -> str:
     """
     Process a single comic file.
@@ -1059,16 +1074,24 @@ def process_file(
                 proposed_meta[field] = current_meta[field]
 
         # --- Confirmation UI ---
-        choice = show_confirmation_ui(path, current_meta, proposed_meta, source, dry_run)
-
-        if choice == "q":
-            return "quit"
-        if choice == "research":
-            skip_cache = True
-            continue  # re-fetch bypassing cache, picker will appear again
-        if choice in ("n", "n_nochange"):
-            return "no_change" if choice == "n_nochange" else "skipped"
-        break  # "y" — proceed to apply
+        if auto:
+            verdict, changes = show_confirmation_ui_auto(path, current_meta, proposed_meta, source)
+            if verdict == "no_change":
+                return "no_change"
+            # fall through to apply; record changes for the end-of-run log
+            if changelog is not None and changes:
+                changelog.append((path, changes))
+            break
+        else:
+            choice = show_confirmation_ui(path, current_meta, proposed_meta, source, dry_run)
+            if choice == "q":
+                return "quit"
+            if choice == "research":
+                skip_cache = True
+                continue  # re-fetch bypassing cache, picker will appear again
+            if choice in ("n", "n_nochange"):
+                return "no_change" if choice == "n_nochange" else "skipped"
+            break  # "y" — proceed to apply
 
     # --- Apply ---
     ok = write_cbz_metadata(path, proposed_meta, dry_run)
@@ -1107,6 +1130,348 @@ def print_summary(stats: dict, errors: List[str], ambiguous: List[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mode: list (display metadata table)
+# ---------------------------------------------------------------------------
+
+# Fields shown in list mode — a concise subset
+LIST_FIELDS = ["Series", "Title", "Number", "Volume", "Year", "Publisher", "Writer", "PageCount"]
+
+# Symbols for quick visual health check
+_TICK  = "[green]✓[/green]"
+_CROSS = "[red]✗[/red]"
+# "Core" fields that really should be present for a well-tagged comic
+CORE_FIELDS = {"Series", "Number", "Year", "Publisher"}
+
+
+def run_list_mode(comics: List[Path]) -> None:
+    """Display a per-file metadata table followed by a per-series collection summary."""
+
+    # --- Read all metadata up front so we only hit each file once ---
+    all_meta: List[Tuple[Path, dict]] = []
+    for path in comics:
+        meta = read_metadata(path)
+        # Fill in anything inferrable from the filename for files with no metadata
+        if not meta.get("Series") or not meta.get("Number"):
+            inferred = parse_filename(path)
+            for k, v in inferred.items():
+                if not meta.get(k):
+                    meta[k] = v
+        all_meta.append((path, meta))
+
+    # -------------------------------------------------------------------------
+    # Table 1: per-file detail
+    # -------------------------------------------------------------------------
+    file_table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold",
+        row_styles=["", "dim"],
+        padding=(0, 1),
+    )
+    file_table.add_column("",          width=1,  no_wrap=True)
+    file_table.add_column("File",      min_width=20, max_width=40, no_wrap=True)
+    file_table.add_column("Fmt",       width=3,  no_wrap=True)
+    file_table.add_column("Series",    min_width=16, max_width=28, no_wrap=True)
+    file_table.add_column("#",         width=4,  no_wrap=True)
+    file_table.add_column("Vol",       width=3,  no_wrap=True)
+    file_table.add_column("Year",      width=4,  no_wrap=True)
+    file_table.add_column("Publisher", min_width=10, max_width=18, no_wrap=True)
+    file_table.add_column("Writer",    min_width=10, max_width=18, no_wrap=True)
+    file_table.add_column("Pages",     width=5,  no_wrap=True)
+
+    missing_core = 0
+    for path, meta in all_meta:
+        fmt = path.suffix.upper().lstrip(".")
+        has_all_core = all(meta.get(f) for f in CORE_FIELDS)
+        indicator = _TICK if has_all_core else _CROSS
+        if not has_all_core:
+            missing_core += 1
+
+        def cell(key: str, max_len: int = 18, _meta: dict = meta) -> str:
+            val = _meta.get(key, "")
+            if not val:
+                return "[dim]—[/dim]"
+            return val[:max_len - 1] + "…" if len(val) >= max_len else val
+
+        file_table.add_row(
+            indicator,
+            path.name[:39] + "…" if len(path.name) > 40 else path.name,
+            fmt,
+            cell("Series", 28),
+            cell("Number", 5),
+            cell("Volume", 4),
+            meta.get("Year", "") or "[dim]—[/dim]",   # year is always 4 chars, never truncate
+            cell("Publisher", 18),
+            cell("Writer",    18),
+            cell("PageCount", 5),
+        )
+
+    console.print(file_table)
+    console.print(
+        f"\n{len(comics)} file(s)  "
+        f"[green]✓ {len(comics) - missing_core} complete[/green]   "
+        f"[red]✗ {missing_core} missing core fields[/red] "
+        f"[dim](Series / Number / Year / Publisher)[/dim]"
+    )
+
+    # -------------------------------------------------------------------------
+    # Table 2: per-series collection summary
+    # -------------------------------------------------------------------------
+    # Group by normalised series name. For each series, track:
+    #   - unique issue numbers present (deduplicating variants like English/Klingon)
+    #   - the reported total issue count (from Count field)
+    #   - publisher (for display)
+    from collections import defaultdict
+
+    # series_key → {
+    #   "numbers": set of unique normalised issue numbers,
+    #   "num_counts": Counter of how many files exist per issue number (to detect variants),
+    #   "count": int|None (total from Comic Vine Count field),
+    #   "publisher": str, "display": str
+    # }
+    from collections import Counter
+    series_map: dict = defaultdict(lambda: {
+        "numbers": set(),
+        "num_counts": Counter(),
+        "count": None,
+        "publisher": "",
+        "display": "",
+    })
+
+    for path, meta in all_meta:
+        series_raw = meta.get("Series", "").strip()
+        series_key = series_raw.lower() if series_raw else "__unknown__"
+        display     = series_raw or "[dim](no series)[/dim]"
+
+        entry = series_map[series_key]
+        if not entry["display"]:
+            entry["display"] = display
+        if not entry["publisher"] and meta.get("Publisher"):
+            entry["publisher"] = meta["Publisher"]
+
+        # Unique issue numbers — normalise to strip leading zeros
+        num = meta.get("Number", "").strip()
+        if num:
+            try:
+                norm = str(int(float(num)))
+            except ValueError:
+                norm = num
+            entry["numbers"].add(norm)
+            entry["num_counts"][norm] += 1
+
+        # Total issue count from metadata (take highest value seen across files)
+        count_str = meta.get("Count", "").strip()
+        if count_str:
+            try:
+                count_int = int(count_str)
+                if entry["count"] is None or count_int > entry["count"]:
+                    entry["count"] = count_int
+            except ValueError:
+                pass
+
+    console.print()
+    console.rule("[bold]Collection summary by series[/bold]")
+    console.print()
+
+    series_table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold",
+        padding=(0, 1),
+    )
+    series_table.add_column("",            width=1,  no_wrap=True)   # status
+    series_table.add_column("Series",      min_width=20, max_width=40, no_wrap=True)
+    series_table.add_column("Publisher",   min_width=10, max_width=20, no_wrap=True)
+    series_table.add_column("Have",        width=5,  no_wrap=True, justify="right")
+    series_table.add_column("Total",       width=5,  no_wrap=True, justify="right")
+    series_table.add_column("Missing",     width=7,  no_wrap=True, justify="right")
+    series_table.add_column("Notes",       min_width=10)
+
+    any_missing = False
+    for series_key in sorted(series_map):
+        entry   = series_map[series_key]
+        have    = len(entry["numbers"])
+        total   = entry["count"]
+        pub     = entry["publisher"] or "[dim]—[/dim]"
+        display = entry["display"]
+        if len(display) > 40:
+            display = display[:39] + "…"
+
+        # Count how many issue numbers have more than one file (variants).
+        # Comic Vine counts each variant as a separate issue, so we subtract
+        # the extra copies to get the adjusted total of distinct story issues.
+        variant_groups = sum(
+            1 for n, c in entry["num_counts"].items() if c > 1
+        )
+        extra_files = sum(
+            c - 1 for c in entry["num_counts"].values() if c > 1
+        )
+        adjusted_total = (total - extra_files) if total is not None else None
+
+        # Build a note about variants if any exist
+        variant_note = ""
+        if variant_groups:
+            nums = sorted(
+                (n for n, c in entry["num_counts"].items() if c > 1),
+                key=lambda x: int(x) if x.isdigit() else 0,
+            )
+            variant_note = f"[dim]{variant_groups} variant issue(s): #{', #'.join(nums)}[/dim]"
+
+        if adjusted_total is None:
+            # No Count data — can't compute missing
+            indicator = "[dim]?[/dim]"
+            have_str    = str(have)
+            total_str   = "[dim]?[/dim]"
+            missing_str = "[dim]?[/dim]"
+            notes       = "[dim]Run fix first to get series total[/dim]"
+        elif have >= adjusted_total:
+            indicator   = _TICK
+            indicator   = _TICK
+            have_str    = f"[green]{have}[/green]"
+            total_str   = str(adjusted_total)
+            missing_str = "[green]0[/green]"
+            notes       = variant_note
+        else:
+            missing = adjusted_total - have
+            any_missing = True
+            indicator   = _CROSS
+            have_str    = str(have)
+            total_str   = str(adjusted_total)
+            missing_str = f"[red]{missing}[/red]"
+            # List the gaps if the series is small enough to enumerate
+            if adjusted_total <= 50:
+                all_nums = set(range(1, adjusted_total + 1))
+                have_ints = set()
+                for n in entry["numbers"]:
+                    try:
+                        have_ints.add(int(float(n)))
+                    except ValueError:
+                        pass
+                gaps = sorted(all_nums - have_ints)
+                notes = _format_gaps(gaps) if gaps else variant_note
+            else:
+                notes = variant_note
+
+        series_table.add_row(
+            indicator, display, pub,
+            have_str, total_str, missing_str, notes,
+        )
+
+    console.print(series_table)
+
+    if any_missing:
+        console.print("\n[red]✗[/red] You are missing issues in one or more series.")
+    else:
+        console.print("\n[green]✓[/green] Collection appears complete for all series with known totals.")
+
+
+def _format_gaps(gaps: List[int]) -> str:
+    """Format a sorted list of integers as compact ranges, e.g. [1,2,3,7,8] → '#1–3, #7–8'."""
+    if not gaps:
+        return ""
+    ranges = []
+    start = end = gaps[0]
+    for n in gaps[1:]:
+        if n == end + 1:
+            end = n
+        else:
+            ranges.append((start, end))
+            start = end = n
+    ranges.append((start, end))
+
+    parts = []
+    for s, e in ranges:
+        parts.append(f"#{s}" if s == e else f"#{s}–{e}")
+    result = ", ".join(parts)
+    # If the list is very long, truncate
+    if len(result) > 60:
+        result = result[:57] + "…"
+    return f"[dim]missing {result}[/dim]"
+
+
+# ---------------------------------------------------------------------------
+# Mode: convert-cbr (bulk CBR → CBZ without metadata changes)
+# ---------------------------------------------------------------------------
+
+def run_convert_cbr_mode(comics: List[Path], dry_run: bool) -> None:
+    """Convert all CBR files to CBZ, leaving metadata untouched."""
+    cbr_files = [c for c in comics if c.suffix.lower() == ".cbr"]
+    if not cbr_files:
+        console.print("[yellow]No CBR files found.[/yellow]")
+        return
+
+    console.print(f"Found [bold]{len(cbr_files)}[/bold] CBR file(s) to convert.\n")
+
+    converted, skipped, errors = 0, 0, 0
+    for i, path in enumerate(cbr_files, 1):
+        console.print(f"[dim][{i}/{len(cbr_files)}][/dim] {path.name}")
+        cbz_path = path.with_suffix(".cbz")
+        if cbz_path.exists():
+            console.print(f"  [yellow]Skipped[/yellow] — {cbz_path.name} already exists")
+            skipped += 1
+            continue
+        result = convert_cbr_to_cbz(path, dry_run=dry_run)
+        if result:
+            converted += 1
+        else:
+            errors += 1
+
+    console.rule()
+    console.print(f"\n[bold]Summary[/bold]")
+    table = Table(box=box.SIMPLE, show_header=False)
+    table.add_column("", style="bold")
+    table.add_column("")
+    table.add_row("[green]Converted[/green]", str(converted))
+    table.add_row("[yellow]Skipped[/yellow]", str(skipped))
+    table.add_row("[red]Errors[/red]",    str(errors))
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Mode: auto (apply all without per-file confirmation)
+# ---------------------------------------------------------------------------
+
+def show_confirmation_ui_auto(
+    file_path: Path,
+    current: dict,
+    proposed: dict,
+    source: str,
+) -> Tuple[str, List[Tuple[str, str, str]]]:
+    """
+    Auto mode: don't prompt, just compute changes.
+    Returns (verdict, changes) where verdict is 'updated'|'no_change'
+    and changes is a list of (field, old_val, new_val) tuples.
+    """
+    changes = []
+    for field in METADATA_FIELDS:
+        old_val = current.get(field, "")
+        new_val = proposed.get(field, "")
+        if old_val != new_val:
+            changes.append((field, old_val, new_val))
+    if changes:
+        return "updated", changes
+    return "no_change", []
+
+
+def print_auto_changelog(changelog: List[Tuple[Path, List[Tuple[str, str, str]]]]) -> None:
+    """Print a summary of all changes made in auto mode."""
+    if not changelog:
+        console.print("[dim]No files were changed.[/dim]")
+        return
+
+    for path, changes in changelog:
+        console.print(f"\n[bold cyan]{path.name}[/bold cyan]")
+        table = Table(box=box.SIMPLE, show_header=True, header_style="bold", padding=(0, 1))
+        table.add_column("Field", style="bold", width=14)
+        table.add_column("Was", width=38)
+        table.add_column("Now", width=38)
+        for field, old_val, new_val in changes:
+            _, old_str, new_str = _field_row(field, old_val, new_val)
+            table.add_row(field, Text.from_markup(old_str), Text.from_markup(new_str))
+        console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1115,6 +1480,23 @@ def main() -> None:
         description="Comic book metadata fixer — fetches and applies ComicInfo.xml metadata."
     )
     parser.add_argument("path", help="Comic file (.cbz/.cbr) or directory to scan")
+
+    # Modes (mutually exclusive)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--list", action="store_true",
+        help="Display a metadata summary table for all files (no changes made)",
+    )
+    mode_group.add_argument(
+        "--convert-cbr", action="store_true",
+        help="Convert all CBR files to CBZ without modifying metadata",
+    )
+    mode_group.add_argument(
+        "--auto", action="store_true",
+        help="Apply all changes without per-file confirmation; print a change log at the end",
+    )
+
+    # General options
     parser.add_argument("--dry-run", action="store_true", help="Show changes without writing")
     parser.add_argument("--no-rename", action="store_true", help="Do not rename files")
     parser.add_argument("--no-cache", action="store_true", help="Ignore cached API results and re-fetch")
@@ -1127,41 +1509,63 @@ def main() -> None:
         console.print(f"[red]Path not found:[/red] {target}")
         sys.exit(1)
 
-    # --- API key ---
-    api_key = get_api_key(args.api_key)
-    if not api_key:
-        api_key = prompt_for_api_key()
-
-    # --- Cache ---
-    cache = DiskCache(Path(args.cache_file))
-
     # --- Discover files ---
     if target.is_file():
         if target.suffix.lower() not in (".cbz", ".cbr"):
             console.print(f"[red]Not a comic file (expected .cbz or .cbr):[/red] {target.name}")
             sys.exit(1)
         comics = [target]
-        console.print(f"\n[bold]Processing:[/bold] {target.name}")
+        console.print(f"\n[bold]Processing:[/bold] {target.name}\n")
     else:
         console.print(f"\n[bold]Scanning:[/bold] {target}")
         comics = find_comics(target)
         if not comics:
             console.print("[yellow]No CBZ or CBR files found.[/yellow]")
             sys.exit(0)
-        console.print(f"Found [bold]{len(comics)}[/bold] comic file(s).")
+        console.print(f"Found [bold]{len(comics)}[/bold] comic file(s).\n")
 
-    console.print()
+    # -------------------------------------------------------------------------
+    # Mode: --list
+    # -------------------------------------------------------------------------
+    if args.list:
+        run_list_mode(comics)
+        return
+
+    # -------------------------------------------------------------------------
+    # Mode: --convert-cbr
+    # -------------------------------------------------------------------------
+    if args.convert_cbr:
+        if args.dry_run:
+            console.print("[yellow]DRY RUN MODE — no files will be modified.[/yellow]\n")
+        run_convert_cbr_mode(comics, dry_run=args.dry_run)
+        return
+
+    # -------------------------------------------------------------------------
+    # Normal / --auto mode: metadata fix
+    # -------------------------------------------------------------------------
+
+    # API key only needed for metadata modes
+    api_key = get_api_key(args.api_key)
+    if not api_key:
+        api_key = prompt_for_api_key()
+
+    cache = DiskCache(Path(args.cache_file))
 
     if args.dry_run:
         console.print("[yellow]DRY RUN MODE — no files will be modified.[/yellow]\n")
+    if args.auto:
+        console.print("[cyan]AUTO MODE — changes will be applied without confirmation.[/cyan]\n")
 
-    # --- Process ---
     stats = {"processed": 0, "updated": 0, "skipped": 0, "no_change": 0, "errors": 0}
     error_files: List[str] = []
     ambiguous_files: List[str] = []
+    changelog: List[Tuple[Path, List[Tuple[str, str, str]]]] = []
 
     for i, comic_path in enumerate(comics, 1):
-        console.print(f"\n[dim][{i}/{len(comics)}][/dim]")
+        if args.auto:
+            console.print(f"[dim][{i}/{len(comics)}] {comic_path.name}[/dim]")
+        else:
+            console.print(f"\n[dim][{i}/{len(comics)}][/dim]")
         stats["processed"] += 1
         try:
             result = process_file(
@@ -1171,6 +1575,8 @@ def main() -> None:
                 dry_run=args.dry_run,
                 no_rename=args.no_rename,
                 no_cache=args.no_cache,
+                auto=args.auto,
+                changelog=changelog,
             )
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted by user.[/yellow]")
@@ -1192,6 +1598,12 @@ def main() -> None:
         elif result == "quit":
             console.print("[yellow]Quitting early.[/yellow]")
             break
+
+    # In auto mode, print the change log before the summary
+    if args.auto and changelog:
+        console.rule()
+        console.print(f"\n[bold]Changes applied ({len(changelog)} file(s)):[/bold]")
+        print_auto_changelog(changelog)
 
     print_summary(stats, error_files, ambiguous_files)
 
