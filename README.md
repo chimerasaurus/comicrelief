@@ -79,6 +79,9 @@ python3 comicrelief.py [OPTIONS] <path>
 | `--no-cache` | Ignore cached API results and re-fetch from Comic Vine |
 | `--api-key KEY` | Comic Vine API key (overrides env var and saved config) |
 | `--cache-file FILE` | Path to JSON cache file (default: `~/.comicrelief_cache.json`) |
+| `--core-fields FIELDS` | Comma-separated fields that must all be present for a ✓ in `--list` mode. Default: `Number,Publisher,Series,Year` |
+| `--fields FIELDS` | Comma-separated columns to show in `--list` mode, overriding the defaults |
+| `--volume-id ID` | Force a specific Comic Vine volume ID for every file in this run |
 
 ---
 
@@ -101,25 +104,47 @@ Displays a table of every file's current embedded metadata with a ✓/✗ health
 │ ✗ │ Star_Trek-SFA.issue-003.cbr      │ CBR │ Star Trek SFA            │ 3 │ —   │ —    │ —         │ —        │ 28    │
 ╰───┴──────────────────────────────────┴─────┴──────────────────────────┴───┴─────┴──────┴───────────┴──────────┴───────╯
 
-3 file(s)  ✓ 1 complete   ✗ 2 missing core fields (Series / Number / Year / Publisher)
+3 file(s)  ✓ 1 complete   ✗ 2 missing core fields (Number / Publisher / Series / Year)
 ```
+
+After the per-file table, a **per-series collection summary** is printed showing how many issues are in the folder vs. the total reported by Comic Vine, with gap detection:
+
+```
+╭──────────────────────────────────┬───────────┬──────┬──────────────────────────────╮
+│ Series                           │ Publisher │ Have │ Missing                      │
+├──────────────────────────────────┼───────────┼──────┼──────────────────────────────┤
+│ Star Trek: Starfleet Academy     │ Marvel    │ 3/19 │ #2–17, #19                   │
+╰──────────────────────────────────┴───────────┴──────┴──────────────────────────────╯
+```
+
+Variant issues (e.g. an English and a Klingon edition of the same issue number) are counted once in the "Have" total.
+
+### Customise which columns appear
+
+Show only series, issue number, and title:
+
+```bash
+python3 comicrelief.py --list --fields "Series,Number,Title" "/Volumes/library/Fiction/Comics"
+```
+
+The default columns are: `Series`, `#` (Number), `Vol` (Volume), `Year`, `Publisher`, `Writer`, `Pages` (PageCount).
+
+Available field names for `--fields`: `Series`, `Title`, `Number`, `Volume`, `Year`, `Month`, `Publisher`, `Imprint`, `Writer`, `Penciller`, `Inker`, `Colorist`, `CoverArtist`, `Editor`, `Genre`, `Tags`, `Characters`, `Summary`, `AgeRating`, `Count`, `PageCount`, `LanguageISO`, `StoryArc`, `Format`.
+
+### Change what counts as "complete"
+
+By default, a file needs Series, Number, Year, and Publisher to earn a ✓. Override this:
+
+```bash
+python3 comicrelief.py --list --core-fields "Series,Number,Title" "/Volumes/library/Fiction/Comics"
+```
+
+If a field is in `--core-fields` but not in the default columns, it is automatically added as a column so you can see the values that are being checked.
 
 ### Fix an entire comics library (interactive)
 
 ```bash
 python3 comicrelief.py "/Volumes/library/Fiction/Comics"
-```
-
-### Fix a single series folder
-
-```bash
-python3 comicrelief.py "/Volumes/library/Fiction/Comics/Star.Trek.Starfleet.Academy.(1996)"
-```
-
-### Preview changes without modifying any files
-
-```bash
-python3 comicrelief.py --dry-run "/Volumes/library/Fiction/Comics"
 ```
 
 ### Fix a single series folder
@@ -134,6 +159,12 @@ python3 comicrelief.py "/Volumes/library/Fiction/Comics/Star.Trek.Starfleet.Acad
 python3 comicrelief.py "/Volumes/library/Fiction/Comics/Star.Trek.Starfleet.Academy.(1996)/Star_Trek-Starfleet_Academy.issue-018.Marvel.1998.cbz"
 ```
 
+### Preview changes without modifying any files
+
+```bash
+python3 comicrelief.py --dry-run "/Volumes/library/Fiction/Comics"
+```
+
 ### Fix metadata only — don't rename files
 
 ```bash
@@ -142,15 +173,13 @@ python3 comicrelief.py --no-rename "/Volumes/library/Fiction/Comics"
 
 ### Re-fetch from Comic Vine, ignoring cached results
 
-Useful if a previous run cached a wrong match (e.g. picked the wrong issue from a multi-issue picker).
+Useful if a previous run cached a wrong match.
 
 ```bash
 python3 comicrelief.py --no-cache "/Volumes/library/Fiction/Comics/Batman.001.cbz"
 ```
 
 ### Apply all changes automatically — no prompts
-
-For when you trust the script to pick the right match. Processes everything silently and prints a full change log at the end.
 
 ```bash
 python3 comicrelief.py --auto "/Volumes/library/Fiction/Comics/Star.Trek.Starfleet.Academy.(1996)"
@@ -161,6 +190,16 @@ You can preview what auto mode *would* do without writing anything:
 ```bash
 python3 comicrelief.py --auto --dry-run "/Volumes/library/Fiction/Comics"
 ```
+
+### Force a specific Comic Vine series
+
+When auto-matching picks the wrong series (e.g. a foreign reprint instead of the original), find the correct series ID in its Comic Vine URL (`comicvine.gamespot.com/…/4050-**5153**/`) and pass it directly:
+
+```bash
+python3 comicrelief.py --volume-id 5153 "/Volumes/library/Fiction/Comics/Star.Trek.Deep.Space.Nine.(1993)"
+```
+
+This overrides auto-matching for every file in the run. Works with both interactive and `--auto` mode.
 
 ### Bulk-convert all CBR files to CBZ
 
@@ -237,23 +276,53 @@ Metadata source: Comic Vine
 │ PageCount │ (empty)               │ 36                    │
 ╰───────────┴───────────────────────┴───────────────────────╯
 
-Apply changes? [y/n/q] (y):
+Apply changes? [y/n/s/i/q] (y):
 ```
 
 **Prompt options:**
-- `y` — apply the proposed metadata and rename the file
-- `n` — skip this file
-- `q` — quit immediately (files already processed are saved)
+| Key | Action |
+|---|---|
+| `y` | Apply the proposed metadata and rename the file |
+| `n` | Skip this file |
+| `s` | Search Comic Vine for a different series name |
+| `i` | Enter a Comic Vine volume ID directly |
+| `q` | Quit immediately (files already processed are saved) |
 
-If no changes are detected, you get:
+If no changes are detected between current and proposed metadata, you get a different prompt:
+
 ```
 No changes detected.
-  s = skip   r = re-search (pick a different match)   q = quit
+  s = skip   r = re-search (pick a different match)   n = new series search   i = enter ID   q = quit
 ```
 
-Use `r` to bypass the cache and re-query Comic Vine — useful when the wrong issue was cached from a previous run.
+| Key | Action |
+|---|---|
+| `s` | Skip this file |
+| `r` | Re-query Comic Vine from scratch (bypasses cache) |
+| `n` | Search for a different series name |
+| `i` | Enter a Comic Vine volume ID directly |
+| `q` | Quit |
 
-### 5. Multiple issues with the same number
+### 5. Picking the right series
+
+If the auto-scored match doesn't look right, press `s` or `n` to search for a different series name. The script queries Comic Vine and shows all results in a numbered picker:
+
+```
+Multiple volumes found — please choose:
+
+  #   Name                                    Year   Publisher         Issues
+  1   Star Trek: Deep Space Nine              1993   Marvel            32
+  2   Star Trek: Deep Space Nine              1996   Marvel            15
+  3   Star Trek: Deep Space Nine - Malibu     1993   Malibu Comics     28
+
+Enter number [1/2/3] (1):
+```
+
+The chosen series sticks for all remaining files in the same run — you only need to pick once per series.
+
+Alternatively, look up the series ID on Comic Vine (`comicvine.gamespot.com/…/4050-**ID**/`) and press `i` to enter it directly, or pass `--volume-id ID` on the command line.
+
+### 6. Multiple issues with the same number
 
 Some series have more than one issue with the same number (e.g. a regular edition and a variant language edition). When this happens, a picker is shown before the confirmation table:
 
@@ -267,18 +336,19 @@ Multiple issues found with this number — please choose:
 Enter number [1/2] (1):
 ```
 
-### 6. Writing changes
+### 7. Writing changes
 
 Changes are written atomically — the script builds the updated archive in a temporary file and swaps it into place, so a crash mid-write won't corrupt your file.
 
 Files are renamed to a canonical format:
 ```
 Series Name (Year) #001.cbz
+Series Name (Year) #001 - Issue Title.cbz   ← when the issue has a title
 ```
 
 Use `--no-rename` to skip renaming and only update the embedded metadata.
 
-### 7. CBR files
+### 8. CBR files
 
 CBR files (RAR archives) cannot have their contents rewritten in-place because the RAR format is proprietary. When a CBR is encountered, the script offers to convert it to CBZ first:
 
@@ -297,6 +367,16 @@ The script auto-detects available extraction tools in this order:
 4. `7z`
 
 On macOS with Homebrew, `brew install libarchive` is the easiest option.
+
+### 9. Volume inconsistency detection
+
+The `--list` table highlights the **Vol** column in yellow when a value looks suspicious:
+
+- The Volume equals the issue Number (a common import error where Vol was set to the issue number instead of the series volume)
+- The Volume differs from the dominant value for that series across all files in the folder
+- The Volume is missing while other files in the series have one
+
+A yellow ⚠ note is printed below the table when any suspicious values are found.
 
 ---
 

@@ -85,6 +85,41 @@ METADATA_FIELDS = [
 # If the API doesn't have them, blank is more honest than keeping a potentially wrong value.
 FIELDS_NO_PRESERVE = {"Summary", "Title"}
 
+# Default columns shown in --list mode (in order)
+DEFAULT_LIST_FIELDS: List[str] = [
+    "Series", "Number", "Volume", "Year", "Publisher", "Writer", "PageCount"
+]
+
+# Per-field display config for --list table columns
+# Each entry: (header_label, rich_column_kwargs, cell_max_len)
+# cell_max_len=None means no truncation (value shown as-is)
+FIELD_COLUMN_SPECS: Dict[str, Tuple] = {
+    "Series":      ("Series",     {"min_width": 16, "max_width": 28, "no_wrap": True}, 28),
+    "Title":       ("Title",      {"min_width": 16, "max_width": 30, "no_wrap": True}, 30),
+    "Number":      ("#",          {"width": 4,  "no_wrap": True}, 5),
+    "Volume":      ("Vol",        {"width": 3,  "no_wrap": True}, 4),
+    "Year":        ("Year",       {"width": 4,  "no_wrap": True}, None),
+    "Month":       ("Mo",         {"width": 2,  "no_wrap": True}, 3),
+    "Publisher":   ("Publisher",  {"min_width": 10, "max_width": 18, "no_wrap": True}, 18),
+    "Imprint":     ("Imprint",    {"min_width": 8,  "max_width": 16, "no_wrap": True}, 16),
+    "Writer":      ("Writer",     {"min_width": 10, "max_width": 18, "no_wrap": True}, 18),
+    "Penciller":   ("Penciller",  {"min_width": 10, "max_width": 18, "no_wrap": True}, 18),
+    "Inker":       ("Inker",      {"min_width": 10, "max_width": 18, "no_wrap": True}, 18),
+    "Colorist":    ("Colorist",   {"min_width": 10, "max_width": 18, "no_wrap": True}, 18),
+    "CoverArtist": ("Cover",      {"min_width": 10, "max_width": 18, "no_wrap": True}, 18),
+    "Editor":      ("Editor",     {"min_width": 10, "max_width": 18, "no_wrap": True}, 18),
+    "Genre":       ("Genre",      {"min_width": 8,  "max_width": 18, "no_wrap": True}, 18),
+    "Tags":        ("Tags",       {"min_width": 8,  "max_width": 20, "no_wrap": True}, 20),
+    "Characters":  ("Characters", {"min_width": 10, "max_width": 22, "no_wrap": True}, 22),
+    "Summary":     ("Summary",    {"min_width": 20, "max_width": 50, "no_wrap": True}, 50),
+    "AgeRating":   ("Rating",     {"width": 8,  "no_wrap": True}, 9),
+    "Count":       ("Count",      {"width": 5,  "no_wrap": True}, 6),
+    "PageCount":   ("Pages",      {"width": 5,  "no_wrap": True}, 5),
+    "LanguageISO": ("Lang",       {"width": 4,  "no_wrap": True}, 5),
+    "StoryArc":    ("Story Arc",  {"min_width": 10, "max_width": 20, "no_wrap": True}, 20),
+    "Format":      ("Format",     {"min_width": 8,  "max_width": 14, "no_wrap": True}, 14),
+}
+
 console = Console()
 
 
@@ -470,12 +505,30 @@ def _cv_get(url: str, params: dict, api_key: str) -> Optional[dict]:
     return None
 
 
-def search_comicvine_volume(series_name: str, year: Optional[str], api_key: str, cache: DiskCache) -> Optional[dict]:
+def search_comicvine_volumes_all(series_name: str, api_key: str) -> list:
+    """Search Comic Vine and return ALL volume results (no scoring, no cache). Used for manual searches."""
+    data = _cv_get(
+        COMICVINE_SEARCH_URL,
+        {
+            "query": series_name,
+            "resources": "volume",
+            "field_list": "id,name,start_year,publisher,count_of_issues",
+            "limit": 15,
+        },
+        api_key,
+    )
+    if not data or data.get("status_code") != 1:
+        return []
+    return data.get("results", [])
+
+
+def search_comicvine_volume(series_name: str, year: Optional[str], api_key: str, cache: DiskCache, skip_cache: bool = False) -> Optional[dict]:
     """Search for a volume (series) on Comic Vine. Returns the best matching volume dict."""
     cache_key = f"cv_vol:{series_name.lower()}:{year or ''}"
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
+    if not skip_cache:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
 
     data = _cv_get(
         COMICVINE_SEARCH_URL,
@@ -573,6 +626,35 @@ def fetch_comicvine_issue(volume_id: int, issue_number: str, api_key: str, cache
     issue = _pick_issue(results)
     cache.set(cache_key, issue)
     return issue
+
+
+def _pick_volume(results: list) -> dict:
+    """Show a numbered list of Comic Vine volumes and let the user choose one."""
+    console.print(f"\n[yellow]Found {len(results)} series — please choose:[/yellow]")
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+    table.add_column("#",         width=4,  no_wrap=True)
+    table.add_column("Series",    min_width=24, no_wrap=True)
+    table.add_column("Start",     width=6,  no_wrap=True)
+    table.add_column("Publisher", min_width=14, no_wrap=True)
+    table.add_column("Issues",    width=7,  no_wrap=True, justify="right")
+    table.add_column("ID",        width=8,  no_wrap=True)
+
+    for i, vol in enumerate(results, 1):
+        pub = vol.get("publisher") or {}
+        pub_name = pub.get("name", "—") if isinstance(pub, dict) else str(pub)
+        table.add_row(
+            str(i),
+            vol.get("name") or "?",
+            str(vol.get("start_year") or "?"),
+            pub_name,
+            str(vol.get("count_of_issues") or "?"),
+            str(vol.get("id", "")),
+        )
+    console.print(table)
+
+    choices = [str(i) for i in range(1, len(results) + 1)]
+    choice = Prompt.ask("Enter number", choices=choices, default="1")
+    return results[int(choice) - 1]
 
 
 def _pick_issue(results: list) -> dict:
@@ -801,22 +883,78 @@ def search_metron(series_name: str, issue_number: Optional[str], year: Optional[
 # Metadata lookup orchestration
 # ---------------------------------------------------------------------------
 
-def fetch_metadata(inferred: dict, api_key: Optional[str], cache: DiskCache, skip_cache: bool = False) -> Tuple[Optional[dict], str]:
+def fetch_comicvine_volume_by_id(volume_id: int, api_key: str, cache: DiskCache) -> Optional[dict]:
+    """
+    Fetch a Comic Vine volume directly by its numeric ID.
+    The ID is the number at the end of the Comic Vine URL:
+      https://comicvine.gamespot.com/series-name/4050-<ID>/
+    """
+    cache_key = f"cv_vol_id:{volume_id}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    field_list = "id,name,start_year,publisher,count_of_issues,description"
+
+    # Primary: single-resource endpoint
+    data = _cv_get(
+        f"https://comicvine.gamespot.com/api/volume/4050-{volume_id}/",
+        {"field_list": field_list},
+        api_key,
+    )
+    if data and data.get("status_code") == 1:
+        result = data.get("results")
+        if result and isinstance(result, dict):
+            cache.set(cache_key, result)
+            return result
+
+    # Fallback: list endpoint with id filter
+    data = _cv_get(
+        COMICVINE_VOLUMES_URL,
+        {"filter": f"id:{volume_id}", "field_list": field_list, "limit": 1},
+        api_key,
+    )
+    if data and data.get("status_code") == 1:
+        results = data.get("results", [])
+        if results:
+            cache.set(cache_key, results[0])
+            return results[0]
+
+    return None
+
+
+def fetch_metadata(
+    inferred: dict,
+    api_key: Optional[str],
+    cache: DiskCache,
+    skip_cache: bool = False,
+    volume_override: Optional[dict] = None,  # pre-selected Comic Vine volume dict
+) -> Tuple[Optional[dict], str]:
     """
     Fetch metadata from Comic Vine (primary) or Metron (fallback).
     Returns (metadata_dict, source_label) or (None, "not found").
     """
+    issue_num = inferred.get("Number")
+
+    # --- Use override volume if provided (user already picked the right series) ---
+    if volume_override and api_key:
+        vol_id = volume_override.get("id")
+        issue = None
+        if vol_id and issue_num:
+            issue = fetch_comicvine_issue(vol_id, issue_num, api_key, cache, skip_cache=skip_cache)
+        meta = extract_cv_metadata(volume_override, issue)
+        return meta, "Comic Vine"
+
     series = inferred.get("Series", "")
     if not series:
         return None, "no series name"
 
     search_name = slugify_series(series)
-    issue_num = inferred.get("Number")
     year = inferred.get("Year")
 
     # --- Comic Vine ---
     if api_key:
-        volume = search_comicvine_volume(search_name, year, api_key, cache)
+        volume = search_comicvine_volume(search_name, year, api_key, cache, skip_cache=skip_cache)
         if volume:
             vol_id = volume.get("id")
             issue = None
@@ -920,20 +1058,45 @@ def show_confirmation_ui(
             console.print("[dim]No changes detected.[/dim]")
             return "n_nochange"
         console.print("\n[dim]No changes detected.[/dim]")
-        console.print("[dim]  s = skip   r = re-search (pick a different match)   q = quit[/dim]")
-        choice = Prompt.ask("", choices=["s", "r", "q"], default="s", show_choices=True)
+        console.print(
+            "[dim]  s = skip   r = re-search (bypass cache)   "
+            "n = search new series name   i = enter Comic Vine volume ID   q = quit[/dim]"
+        )
+        choice = Prompt.ask("", choices=["s", "r", "n", "i", "q"], default="s", show_choices=True)
+        if choice == "n":
+            new_name = Prompt.ask("  Search Comic Vine for series").strip()
+            return ("search_series", new_name) if new_name else "research"
+        if choice == "i":
+            raw = Prompt.ask("  Comic Vine volume ID (numeric, from the URL)").strip()
+            if raw.isdigit():
+                return ("volume_id", int(raw))
+            console.print("[yellow]  Not a valid ID — falling back to re-search.[/yellow]")
+            return "research"
         return {"s": "n_nochange", "r": "research", "q": "q"}.get(choice, "n_nochange")
 
     if dry_run:
         console.print("[yellow](dry-run mode — no files will be changed)[/yellow]")
         return "y"
 
+    console.print(
+        "\n[dim]  y = apply   n = skip   r = re-search (same name, bypass cache)"
+        "   s = search new series name   i = enter Comic Vine volume ID   q = quit[/dim]"
+    )
     choice = Prompt.ask(
-        "\n[bold]Apply changes?[/bold]",
-        choices=["y", "n", "q"],
+        "[bold]Apply changes?[/bold]",
+        choices=["y", "n", "r", "s", "i", "q"],
         default="y",
         show_choices=True,
     )
+    if choice == "s":
+        new_name = Prompt.ask("  Search Comic Vine for series").strip()
+        return ("search_series", new_name) if new_name else "research"
+    if choice == "i":
+        raw = Prompt.ask("  Comic Vine volume ID (numeric, from the URL)").strip()
+        if raw.isdigit():
+            return ("volume_id", int(raw))
+        console.print("[yellow]  Not a valid ID — falling back to re-search.[/yellow]")
+        return "research"
     return choice
 
 
@@ -980,6 +1143,14 @@ def canonical_filename(metadata: dict, original_path: Path) -> str:
     return name + ext
 
 
+def _rename_if_needed(path: Path, metadata: dict, dry_run: bool) -> Path:
+    """Rename file if its name doesn't already match the canonical form."""
+    expected = canonical_filename(metadata, path)
+    if path.name != expected:
+        return rename_file(path, metadata, dry_run)
+    return path
+
+
 def rename_file(path: Path, metadata: dict, dry_run: bool) -> Path:
     """Rename file to canonical form. Returns new path (or original if unchanged)."""
     new_name = canonical_filename(metadata, path)
@@ -1019,6 +1190,7 @@ def process_file(
     no_cache: bool = False,
     auto: bool = False,
     changelog: Optional[List] = None,
+    volume_overrides: Optional[dict] = None,  # series_key → Comic Vine volume dict
 ) -> str:
     """
     Process a single comic file.
@@ -1052,10 +1224,19 @@ def process_file(
     # Merge: existing metadata takes priority over filename inference
     inferred = {**filename_inferred, **current_meta}
 
-    # --- Fetch from API (loop allows re-search if user picks 'r') ---
+    # --- Fetch from API (loop allows re-search / ID override) ---
     skip_cache = no_cache
+    series_key = slugify_series(inferred.get("Series", "")).lower()
+    # Wildcard "*" wins over series-specific key (set by --volume-id flag)
+    overrides = volume_overrides or {}
+    active_volume = overrides.get("*") or overrides.get(series_key)
+
     while True:
-        proposed_meta, source = fetch_metadata(inferred, api_key, cache, skip_cache=skip_cache)
+        proposed_meta, source = fetch_metadata(
+            inferred, api_key, cache,
+            skip_cache=skip_cache,
+            volume_override=active_volume,
+        )
         if proposed_meta is None:
             console.print(f"[yellow]Could not find metadata for:[/yellow] {path.name} (series: {inferred.get('Series', '?')})")
             console.print("[dim]Skipping.[/dim]")
@@ -1067,8 +1248,7 @@ def process_file(
             proposed_meta["PageCount"] = str(page_count)
 
         # Preserve fields not returned by API that are already set,
-        # except fields where a missing API value is meaningful (e.g. Summary, Title —
-        # carrying those over from the current file would hide wrong existing data).
+        # except fields where a missing API value is meaningful.
         for field in METADATA_FIELDS:
             if field not in proposed_meta and field not in FIELDS_NO_PRESERVE and current_meta.get(field):
                 proposed_meta[field] = current_meta[field]
@@ -1077,20 +1257,71 @@ def process_file(
         if auto:
             verdict, changes = show_confirmation_ui_auto(path, current_meta, proposed_meta, source)
             if verdict == "no_change":
+                if not no_rename:
+                    _rename_if_needed(path, proposed_meta, dry_run)
                 return "no_change"
-            # fall through to apply; record changes for the end-of-run log
             if changelog is not None and changes:
                 changelog.append((path, changes))
             break
         else:
             choice = show_confirmation_ui(path, current_meta, proposed_meta, source, dry_run)
+
             if choice == "q":
                 return "quit"
+
             if choice == "research":
                 skip_cache = True
-                continue  # re-fetch bypassing cache, picker will appear again
-            if choice in ("n", "n_nochange"):
-                return "no_change" if choice == "n_nochange" else "skipped"
+                active_volume = None
+                continue
+
+            if isinstance(choice, tuple) and choice[0] == "search_series":
+                # User typed a new series name — fetch all results and show a picker
+                new_name = choice[1]
+                console.print(f"[dim]Searching Comic Vine for:[/dim] {new_name}")
+                results = search_comicvine_volumes_all(new_name, api_key)
+                if not results:
+                    console.print(f"[yellow]No results for '{new_name}'. Try a different name or enter an ID with [i].[/yellow]")
+                    continue
+                new_volume = _pick_volume(results) if len(results) > 1 else results[0]
+                pub = (new_volume.get("publisher") or {}).get("name", "?")
+                console.print(
+                    f"[green]Using:[/green] {new_volume.get('name')} "
+                    f"({new_volume.get('start_year')}, {pub}, "
+                    f"{new_volume.get('count_of_issues')} issues)"
+                )
+                active_volume = new_volume
+                # Save override so all subsequent files in this folder use the same volume
+                if volume_overrides is not None:
+                    volume_overrides[series_key] = active_volume
+                skip_cache = True
+                continue
+
+            if isinstance(choice, tuple) and choice[0] == "volume_id":
+                # User supplied a Comic Vine volume ID directly
+                vol_id = choice[1]
+                console.print(f"[dim]Fetching Comic Vine volume ID {vol_id}…[/dim]")
+                new_volume = fetch_comicvine_volume_by_id(vol_id, api_key, cache)
+                if not new_volume:
+                    console.print(f"[yellow]Could not fetch volume ID {vol_id}. Check the ID and try again.[/yellow]")
+                    continue
+                pub = (new_volume.get("publisher") or {}).get("name", "?")
+                console.print(
+                    f"[green]Matched:[/green] {new_volume.get('name')} "
+                    f"({new_volume.get('start_year')}, {pub}, "
+                    f"{new_volume.get('count_of_issues')} issues)"
+                )
+                active_volume = new_volume
+                if volume_overrides is not None:
+                    volume_overrides[series_key] = active_volume
+                skip_cache = True
+                continue
+
+            if choice == "n":
+                return "skipped"
+            if choice == "n_nochange":
+                if not no_rename:
+                    _rename_if_needed(path, proposed_meta, dry_run)
+                return "no_change"
             break  # "y" — proceed to apply
 
     # --- Apply ---
@@ -1133,30 +1364,71 @@ def print_summary(stats: dict, errors: List[str], ambiguous: List[str]) -> None:
 # Mode: list (display metadata table)
 # ---------------------------------------------------------------------------
 
-# Fields shown in list mode — a concise subset
-LIST_FIELDS = ["Series", "Title", "Number", "Volume", "Year", "Publisher", "Writer", "PageCount"]
-
 # Symbols for quick visual health check
 _TICK  = "[green]✓[/green]"
 _CROSS = "[red]✗[/red]"
-# "Core" fields that really should be present for a well-tagged comic
-CORE_FIELDS = {"Series", "Number", "Year", "Publisher"}
+# Default core fields — presence of all of these earns a ✓
+DEFAULT_CORE_FIELDS = {"Series", "Number", "Year", "Publisher"}
 
 
-def run_list_mode(comics: List[Path]) -> None:
-    """Display a per-file metadata table followed by a per-series collection summary."""
+def _dominant_volume(series_metas: List[dict]) -> Optional[str]:
+    """
+    Return the most common non-empty Volume value across a series.
+    Used to detect files where Volume was incorrectly set to equal the issue number.
+    """
+    from collections import Counter
+    counts: Counter = Counter()
+    for meta in series_metas:
+        v = meta.get("Volume", "").strip()
+        if v:
+            counts[v] += 1
+    if not counts:
+        return None
+    return counts.most_common(1)[0][0]
+
+
+def run_list_mode(
+    comics: List[Path],
+    core_fields: Optional[set] = None,
+    display_fields: Optional[List[str]] = None,
+) -> None:
+    """Display a per-file metadata table followed by a per-series collection summary.
+
+    display_fields controls which metadata columns appear (order matters).
+    If None, defaults to DEFAULT_LIST_FIELDS plus any core_fields not already included.
+    """
+    if core_fields is None:
+        core_fields = DEFAULT_CORE_FIELDS
+
+    # Build the column list:
+    # - If caller explicitly passed display_fields, use exactly that.
+    # - Otherwise use defaults and auto-append any core fields not already present.
+    if display_fields is not None:
+        col_fields = list(display_fields)
+    else:
+        col_fields = list(DEFAULT_LIST_FIELDS)
+        for cf in sorted(core_fields):
+            if cf not in col_fields:
+                col_fields.append(cf)
 
     # --- Read all metadata up front so we only hit each file once ---
     all_meta: List[Tuple[Path, dict]] = []
     for path in comics:
         meta = read_metadata(path)
-        # Fill in anything inferrable from the filename for files with no metadata
         if not meta.get("Series") or not meta.get("Number"):
             inferred = parse_filename(path)
             for k, v in inferred.items():
                 if not meta.get(k):
                     meta[k] = v
         all_meta.append((path, meta))
+
+    # --- Pre-compute per-series dominant Volume for inconsistency detection ---
+    from collections import defaultdict as _dd
+    series_to_metas: dict = _dd(list)
+    for _, meta in all_meta:
+        key = meta.get("Series", "").lower() or "__unknown__"
+        series_to_metas[key].append(meta)
+    dominant_vol: dict = {k: _dominant_volume(v) for k, v in series_to_metas.items()}
 
     # -------------------------------------------------------------------------
     # Table 1: per-file detail
@@ -1168,51 +1440,88 @@ def run_list_mode(comics: List[Path]) -> None:
         row_styles=["", "dim"],
         padding=(0, 1),
     )
-    file_table.add_column("",          width=1,  no_wrap=True)
-    file_table.add_column("File",      min_width=20, max_width=40, no_wrap=True)
-    file_table.add_column("Fmt",       width=3,  no_wrap=True)
-    file_table.add_column("Series",    min_width=16, max_width=28, no_wrap=True)
-    file_table.add_column("#",         width=4,  no_wrap=True)
-    file_table.add_column("Vol",       width=3,  no_wrap=True)
-    file_table.add_column("Year",      width=4,  no_wrap=True)
-    file_table.add_column("Publisher", min_width=10, max_width=18, no_wrap=True)
-    file_table.add_column("Writer",    min_width=10, max_width=18, no_wrap=True)
-    file_table.add_column("Pages",     width=5,  no_wrap=True)
+    # Fixed columns always present
+    file_table.add_column("",     width=1,  no_wrap=True)
+    file_table.add_column("File", min_width=20, max_width=40, no_wrap=True)
+    file_table.add_column("Fmt",  width=3,  no_wrap=True)
+
+    # Dynamic metadata columns
+    for field in col_fields:
+        spec = FIELD_COLUMN_SPECS.get(field)
+        if spec:
+            header, kwargs, _ = spec
+            file_table.add_column(header, **kwargs)
+        else:
+            # Unknown/unlisted field — generic column
+            file_table.add_column(field, min_width=8, max_width=20, no_wrap=True)
+
+    def cell(key: str, max_len: Optional[int], _meta: dict) -> str:
+        val = _meta.get(key, "")
+        if not val:
+            return "[dim]—[/dim]"
+        if max_len is None:
+            return val
+        return val[:max_len - 1] + "…" if len(val) >= max_len else val
 
     missing_core = 0
     for path, meta in all_meta:
         fmt = path.suffix.upper().lstrip(".")
-        has_all_core = all(meta.get(f) for f in CORE_FIELDS)
+        has_all_core = all(meta.get(f) for f in core_fields)
         indicator = _TICK if has_all_core else _CROSS
         if not has_all_core:
             missing_core += 1
 
-        def cell(key: str, max_len: int = 18, _meta: dict = meta) -> str:
-            val = _meta.get(key, "")
-            if not val:
-                return "[dim]—[/dim]"
-            return val[:max_len - 1] + "…" if len(val) >= max_len else val
+        # Pre-compute Vol suspicious flag (needed whether or not Volume is in col_fields)
+        vol_val = meta.get("Volume", "").strip()
+        num_val = meta.get("Number", "").strip()
+        s_key   = meta.get("Series", "").lower() or "__unknown__"
+        dom_vol = dominant_vol.get(s_key)
+        vol_suspicious = bool(
+            vol_val and num_val and vol_val == num_val and num_val != "1"
+        ) or bool(
+            vol_val and dom_vol and vol_val != dom_vol
+        ) or bool(
+            not vol_val and dom_vol  # missing when others have it
+        )
 
-        file_table.add_row(
+        row_cells = [
             indicator,
             path.name[:39] + "…" if len(path.name) > 40 else path.name,
             fmt,
-            cell("Series", 28),
-            cell("Number", 5),
-            cell("Volume", 4),
-            meta.get("Year", "") or "[dim]—[/dim]",   # year is always 4 chars, never truncate
-            cell("Publisher", 18),
-            cell("Writer",    18),
-            cell("PageCount", 5),
-        )
+        ]
 
+        for field in col_fields:
+            if field == "Volume":
+                # Special yellow highlight for suspicious Vol values
+                if vol_suspicious:
+                    row_cells.append(f"[yellow]{vol_val}[/yellow]" if vol_val else "[yellow]—[/yellow]")
+                else:
+                    spec = FIELD_COLUMN_SPECS.get("Volume")
+                    row_cells.append(cell("Volume", spec[2] if spec else 4, meta))
+            elif field == "Year":
+                # Year: never truncate
+                row_cells.append(meta.get("Year", "") or "[dim]—[/dim]")
+            else:
+                spec = FIELD_COLUMN_SPECS.get(field)
+                max_len = spec[2] if spec else 20
+                row_cells.append(cell(field, max_len, meta))
+
+        file_table.add_row(*row_cells)
+
+    core_label = " / ".join(sorted(core_fields))
     console.print(file_table)
     console.print(
         f"\n{len(comics)} file(s)  "
         f"[green]✓ {len(comics) - missing_core} complete[/green]   "
         f"[red]✗ {missing_core} missing core fields[/red] "
-        f"[dim](Series / Number / Year / Publisher)[/dim]"
+        f"[dim]({core_label})[/dim]"
     )
+    if any(
+        (meta.get("Volume", "") and meta.get("Number", "") and meta.get("Volume") == meta.get("Number") and meta.get("Number") != "1")
+        or (meta.get("Volume", "") != (dominant_vol.get((meta.get("Series","").lower() or "__unknown__")) or meta.get("Volume","")))
+        for _, meta in all_meta
+    ):
+        console.print("  [yellow]⚠ Yellow Vol cells indicate inconsistent or suspicious volume numbers.[/yellow]")
 
     # -------------------------------------------------------------------------
     # Table 2: per-series collection summary
@@ -1502,6 +1811,37 @@ def main() -> None:
     parser.add_argument("--no-cache", action="store_true", help="Ignore cached API results and re-fetch")
     parser.add_argument("--api-key", help="Comic Vine API key")
     parser.add_argument("--cache-file", default=str(DEFAULT_CACHE_PATH), help="Path to API cache JSON file")
+    parser.add_argument(
+        "--core-fields",
+        default=None,
+        help=(
+            "Comma-separated fields that must be present for a ✓ in --list mode. "
+            f"Default: {','.join(sorted(DEFAULT_CORE_FIELDS))}. "
+            f"Available: {', '.join(METADATA_FIELDS)}"
+        ),
+    )
+    parser.add_argument(
+        "--fields",
+        default=None,
+        metavar="FIELD[,FIELD…]",
+        help=(
+            "Comma-separated list of metadata columns to show in --list mode, "
+            "overriding the defaults. "
+            f"Default columns: {','.join(DEFAULT_LIST_FIELDS)}. "
+            f"Available: {', '.join(METADATA_FIELDS)}"
+        ),
+    )
+    parser.add_argument(
+        "--volume-id",
+        type=int,
+        default=None,
+        metavar="ID",
+        help=(
+            "Force a specific Comic Vine volume ID for every file in this run. "
+            "Find the ID in the URL: comicvine.gamespot.com/…/4050-ID/. "
+            "Useful when auto-matching picks the wrong series."
+        ),
+    )
     args = parser.parse_args()
 
     target = Path(args.path)
@@ -1528,7 +1868,28 @@ def main() -> None:
     # Mode: --list
     # -------------------------------------------------------------------------
     if args.list:
-        run_list_mode(comics)
+        if args.core_fields:
+            raw = [f.strip() for f in args.core_fields.split(",")]
+            invalid = [f for f in raw if f not in METADATA_FIELDS]
+            if invalid:
+                console.print(f"[red]Unknown field(s) in --core-fields:[/red] {', '.join(invalid)}")
+                console.print(f"[dim]Available: {', '.join(METADATA_FIELDS)}[/dim]")
+                sys.exit(1)
+            core_fields = set(raw)
+        else:
+            core_fields = None
+
+        display_fields: Optional[List[str]] = None
+        if args.fields:
+            raw_fields = [f.strip() for f in args.fields.split(",")]
+            invalid_fields = [f for f in raw_fields if f not in METADATA_FIELDS]
+            if invalid_fields:
+                console.print(f"[red]Unknown field(s) in --fields:[/red] {', '.join(invalid_fields)}")
+                console.print(f"[dim]Available: {', '.join(METADATA_FIELDS)}[/dim]")
+                sys.exit(1)
+            display_fields = raw_fields
+
+        run_list_mode(comics, core_fields=core_fields, display_fields=display_fields)
         return
 
     # -------------------------------------------------------------------------
@@ -1560,6 +1921,25 @@ def main() -> None:
     error_files: List[str] = []
     ambiguous_files: List[str] = []
     changelog: List[Tuple[Path, List[Tuple[str, str, str]]]] = []
+    volume_overrides: dict = {}  # series_key → CV volume dict; sticky across files in a run
+
+    # --volume-id: resolve the volume once and use it for every file in this run
+    if args.volume_id:
+        if not api_key:
+            console.print("[red]--volume-id requires a Comic Vine API key.[/red]")
+            sys.exit(1)
+        console.print(f"[dim]Fetching Comic Vine volume ID {args.volume_id}…[/dim]")
+        forced_volume = fetch_comicvine_volume_by_id(args.volume_id, api_key, cache)
+        if not forced_volume:
+            console.print(f"[red]Could not fetch Comic Vine volume ID {args.volume_id}. Check the ID.[/red]")
+            sys.exit(1)
+        pub = (forced_volume.get("publisher") or {}).get("name", "?")
+        console.print(
+            f"[green]Volume override:[/green] {forced_volume.get('name')} "
+            f"({forced_volume.get('start_year')}, {pub}, {forced_volume.get('count_of_issues')} issues)\n"
+        )
+        # Store under the wildcard key "*" — process_file checks this before the series key
+        volume_overrides["*"] = forced_volume
 
     for i, comic_path in enumerate(comics, 1):
         if args.auto:
@@ -1577,6 +1957,7 @@ def main() -> None:
                 no_cache=args.no_cache,
                 auto=args.auto,
                 changelog=changelog,
+                volume_overrides=volume_overrides,
             )
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted by user.[/yellow]")
