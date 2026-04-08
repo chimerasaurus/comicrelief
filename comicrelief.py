@@ -17,6 +17,7 @@ Options:
 """
 
 import argparse
+import html
 import io
 import json
 import warnings
@@ -774,11 +775,15 @@ def extract_cv_metadata(volume: dict, issue: Optional[dict]) -> dict:
 
         # Summary — strip HTML tags from description, normalize whitespace
         desc = issue.get("description", "") or ""
-        desc = re.sub(r"<br\s*/?>", "\n", desc, flags=re.IGNORECASE)  # preserve line breaks
-        desc = re.sub(r"<[^>]+>", " ", desc)   # replace other tags with space
-        desc = re.sub(r"[ \t]+", " ", desc)     # collapse horizontal whitespace
-        desc = re.sub(r"\n[ \t]+", "\n", desc)  # trim leading space on each line
-        desc = re.sub(r"\n{3,}", "\n\n", desc)  # max two consecutive newlines
+        # Block-level elements become paragraph breaks
+        desc = re.sub(r"</?(p|div|h[1-6]|ul|ol|li|blockquote|section)\b[^>]*>",
+                      "\n\n", desc, flags=re.IGNORECASE)
+        desc = re.sub(r"<br\s*/?>", "\n", desc, flags=re.IGNORECASE)  # <br> → newline
+        desc = re.sub(r"<[^>]+>", "", desc)        # strip all remaining tags
+        desc = html.unescape(desc)                  # decode &amp; &lt; &#160; etc.
+        desc = re.sub(r"[ \t]+", " ", desc)         # collapse horizontal whitespace
+        desc = re.sub(r"\n[ \t]+", "\n", desc)      # trim leading space on each line
+        desc = re.sub(r"\n{3,}", "\n\n", desc)      # max two consecutive newlines
         desc = desc.strip()
         if desc:
             meta["Summary"] = desc[:2000]  # cap length
