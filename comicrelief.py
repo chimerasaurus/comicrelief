@@ -603,7 +603,7 @@ def fetch_comicvine_issue(volume_id: int, issue_number: str, api_key: str, cache
         {
             "filter": f"volume:{volume_id},issue_number:{normalized}",
             "field_list": (
-                "id,name,issue_number,cover_date,description,person_credits,"
+                "id,name,issue_number,cover_date,description,page_count,person_credits,"
                 "character_credits,story_arc_credits,volume"
             ),
             "limit": 5,
@@ -1306,12 +1306,13 @@ def show_confirmation_ui(
         return "y"
 
     console.print(
-        "\n[dim]  y = apply   n = skip   r = re-search (same name, bypass cache)"
+        "\n[dim]  y = apply   a = apply all remaining   n = skip"
+        "   r = re-search (same name, bypass cache)"
         "   s = search new series name   i = enter Comic Vine volume ID   q = quit[/dim]"
     )
     choice = Prompt.ask(
         "[bold]Apply changes?[/bold]",
-        choices=["y", "n", "r", "s", "i", "q"],
+        choices=["y", "a", "n", "r", "s", "i", "q"],
         default="y",
         show_choices=True,
     )
@@ -1425,6 +1426,7 @@ def process_file(
     Returns: 'updated', 'skipped', 'no_change', 'error', 'quit', 'converted'
     """
     is_cbr = path.suffix.lower() == ".cbr"
+    apply_all = False  # set to True when user picks 'a' (apply all remaining)
 
     # --- CBR: offer conversion ---
     if is_cbr:
@@ -1554,7 +1556,9 @@ def process_file(
                 if not no_rename:
                     _rename_if_needed(path, proposed_meta, dry_run)
                 return "no_change"
-            break  # "y" — proceed to apply
+            if choice == "a":
+                apply_all = True
+            break  # "y" or "a" — proceed to apply
 
     # --- Apply ---
     ok = write_cbz_metadata(path, proposed_meta, dry_run)
@@ -1565,7 +1569,7 @@ def process_file(
     if not no_rename:
         rename_file(path, proposed_meta, dry_run)
 
-    return "updated"
+    return "apply_all" if apply_all else "updated"
 
 
 def print_summary(stats: dict, errors: List[str], ambiguous: List[str]) -> None:
@@ -1590,6 +1594,164 @@ def print_summary(stats: dict, errors: List[str], ambiguous: List[str]) -> None:
         console.print("\n[yellow]Files with ambiguous/missing metadata:[/yellow]")
         for a in ambiguous:
             console.print(f"  • {a}")
+
+
+# ---------------------------------------------------------------------------
+# Mode: check-pages (page count integrity)
+# ---------------------------------------------------------------------------
+
+def _get_cv_page_count(meta: dict, cache: "DiskCache") -> Optional[int]:
+    """
+    Look up the Comic Vine page count for a comic from the local disk cache.
+    Requires that comicrelief has already been run on the file (which populates
+    the cache).  Returns None if no cached issue data is found.
+    """
+    series = meta.get("Series", "")
+    number = meta.get("Number", "")
+    year   = meta.get("Year", "")
+    if not series or not number:
+        return None
+
+    search_name = slugify_series(series).lower()
+
+    # Try to find a cached volume for this series (try with and without year)
+    volume = None
+    for yr in ([year, ""] if year else [""]):
+        v = cache.get(f"cv_vol:{search_name}:{yr}")
+        if v:
+            volume = v
+            break
+        candidates = cache.get(f"cv_vol_list:{search_name}:{yr}")
+        if candidates:
+            volume = candidates[0]
+            break
+
+    if not volume:
+        return None
+
+    vol_id = volume.get("id")
+    if not vol_id:
+        return None
+
+    # Normalise issue number to match the cache key written by fetch_comicvine_issue
+    num_norm = (
+        str(int(float(number)))
+        if number.replace(".", "").isdigit()
+        else number
+    )
+    issue = cache.get(f"cv_issue:{vol_id}:{num_norm}") or cache.get(f"cv_issue:{vol_id}:{number}")
+    if not issue:
+        return None
+
+    pc = issue.get("page_count")
+    try:
+        val = int(pc)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def run_check_pages_mode(comics: List[Path], cache: "DiskCache") -> None:
+    """
+    Check actual image counts in CBZ/CBR files against:
+      - Stored  : the PageCount field in ComicInfo.xml
+      - CV      : Comic Vine's page_count (read from local cache — run
+                  comicrelief on the folder first to populate it)
+
+    Delta = Actual − CV.  A negative delta means pages may be missing.
+    Note: CV counts include ads and letters pages; scans that skip ads
+    will show a small negative delta even when complete.
+    """
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold",
+        row_styles=["", "dim"],
+        padding=(0, 1),
+    )
+    table.add_column("",       width=1,  no_wrap=True)
+    table.add_column("File",   min_width=24, max_width=52, no_wrap=True)
+    table.add_column("Fmt",    width=3,  no_wrap=True)
+    table.add_column("Actual", width=6,  justify="right", no_wrap=True)
+    table.add_column("Stored", width=6,  justify="right", no_wrap=True)
+    table.add_column("CV",     width=6,  justify="right", no_wrap=True)
+    table.add_column("Delta",  width=7,  justify="right", no_wrap=True)
+
+    ok_count = mismatch_count = unknown_count = 0
+    has_cv_data = False
+
+    for path in comics:
+        fmt    = path.suffix.upper().lstrip(".")
+        actual = get_page_count(path)
+        meta   = read_metadata(path)
+
+        stored_str = meta.get("PageCount", "")
+        stored: Optional[int] = int(stored_str) if stored_str and stored_str.isdigit() else None
+
+        cv_count = _get_cv_page_count(meta, cache)
+        if cv_count is not None:
+            has_cv_data = True
+
+        # Status — primary reference is CV; fall back to Stored if no CV data
+        if cv_count is not None:
+            is_ok: Optional[bool] = (actual == cv_count)
+        elif stored is not None:
+            is_ok = (actual == stored)
+        else:
+            is_ok = None  # no reference at all
+
+        if is_ok is None:
+            status = "[yellow]?[/yellow]"
+            unknown_count += 1
+        elif is_ok:
+            status = "[green]✓[/green]"
+            ok_count += 1
+        else:
+            status = "[red]✗[/red]"
+            mismatch_count += 1
+
+        actual_cell = str(actual) if actual else "[dim]—[/dim]"
+        stored_cell = str(stored) if stored is not None else "[dim]—[/dim]"
+        cv_cell     = str(cv_count) if cv_count is not None else "[dim]—[/dim]"
+
+        if cv_count is not None:
+            delta = actual - cv_count
+            if delta == 0:
+                delta_cell = "[green]0[/green]"
+            elif delta < 0:
+                delta_cell = f"[red]{delta}[/red]"
+            else:
+                delta_cell = f"[yellow]+{delta}[/yellow]"
+        elif stored is not None and actual != stored:
+            delta = actual - stored
+            delta_cell = f"[red]{delta}[/red]" if delta < 0 else f"[yellow]+{delta}[/yellow]"
+        else:
+            delta_cell = "[dim]—[/dim]"
+
+        fname = path.name
+        if len(fname) > 52:
+            fname = fname[:51] + "…"
+
+        table.add_row(status, fname, fmt, actual_cell, stored_cell, cv_cell, delta_cell)
+
+    console.print(table)
+    console.print(
+        f"\n{len(comics)} file(s)   "
+        f"[green]✓ {ok_count} OK[/green]   "
+        f"[red]✗ {mismatch_count} mismatch[/red]   "
+        f"[yellow]? {unknown_count} no reference[/yellow]"
+    )
+
+    if not has_cv_data:
+        console.print(
+            "\n[dim]CV column is empty — run comicrelief on this folder first "
+            "to populate the Comic Vine page-count cache.[/dim]"
+        )
+    elif mismatch_count:
+        console.print(
+            "\n[dim]Tip: CV counts include ads and letters pages. "
+            "A small negative delta (−1 to −5) may be expected if your scans skip ads.[/dim]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2036,6 +2198,13 @@ def main() -> None:
         "--auto", action="store_true",
         help="Apply all changes without per-file confirmation; print a change log at the end",
     )
+    mode_group.add_argument(
+        "--check-pages", action="store_true",
+        help=(
+            "Check actual image counts against stored and Comic Vine page counts. "
+            "Run comicrelief on the folder first to populate the CV cache."
+        ),
+    )
 
     # General options
     parser.add_argument("--dry-run", action="store_true", help="Show changes without writing")
@@ -2126,6 +2295,14 @@ def main() -> None:
         return
 
     # -------------------------------------------------------------------------
+    # Mode: --check-pages
+    # -------------------------------------------------------------------------
+    if args.check_pages:
+        cache = DiskCache(Path(args.cache_file))
+        run_check_pages_mode(comics, cache)
+        return
+
+    # -------------------------------------------------------------------------
     # Mode: --convert-cbr
     # -------------------------------------------------------------------------
     if args.convert_cbr:
@@ -2174,8 +2351,11 @@ def main() -> None:
         # Store under the wildcard key "*" — process_file checks this before the series key
         volume_overrides["*"] = forced_volume
 
+    force_auto = False  # becomes True when user picks 'a' mid-review
+
     for i, comic_path in enumerate(comics, 1):
-        if args.auto:
+        is_auto = args.auto or force_auto
+        if is_auto:
             console.print(f"[dim][{i}/{len(comics)}] {comic_path.name}[/dim]")
         else:
             console.print(f"\n[dim][{i}/{len(comics)}][/dim]")
@@ -2188,7 +2368,7 @@ def main() -> None:
                 dry_run=args.dry_run,
                 no_rename=args.no_rename,
                 no_cache=args.no_cache,
-                auto=args.auto,
+                auto=is_auto,
                 smart_match=args.smart_match,
                 changelog=changelog,
                 volume_overrides=volume_overrides,
@@ -2200,8 +2380,15 @@ def main() -> None:
             console.print(f"[red]Unexpected error processing {comic_path.name}: {e}[/red]")
             result = "error"
 
-        if result == "updated":
+        if result in ("updated", "apply_all"):
             stats["updated"] += 1
+            if result == "apply_all":
+                force_auto = True
+                remaining = len(comics) - i
+                console.print(
+                    f"\n[cyan]Switching to auto mode — "
+                    f"applying {remaining} remaining file(s) without confirmation.[/cyan]\n"
+                )
         elif result == "skipped":
             stats["skipped"] += 1
             ambiguous_files.append(str(comic_path))
@@ -2215,7 +2402,7 @@ def main() -> None:
             break
 
     # In auto mode, print the change log before the summary
-    if args.auto and changelog:
+    if (args.auto or force_auto) and changelog:
         console.rule()
         console.print(f"\n[bold]Changes applied ({len(changelog)} file(s)):[/bold]")
         print_auto_changelog(changelog)

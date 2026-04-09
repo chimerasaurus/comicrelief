@@ -72,6 +72,7 @@ python3 comicrelief.py [OPTIONS] <path>
 | `--list` | Display a metadata summary table for all files; no changes made |
 | `--convert-cbr` | Convert all CBR files to CBZ without touching metadata |
 | `--auto` | Apply all changes without per-file prompts; print a change log at the end |
+| `--check-pages` | Check actual image counts against stored and Comic Vine page counts |
 
 ### Options
 
@@ -383,6 +384,37 @@ The script auto-detects available extraction tools in this order:
 4. `7z`
 
 On macOS with Homebrew, `brew install libarchive` is the easiest option.
+
+### 11. Page count checking
+
+```bash
+python3 comicrelief.py --check-pages "/Volumes/library/Fiction/Comics/Alien.(2024)"
+```
+
+Checks every CBZ/CBR in the folder and shows a table with four key values per file:
+
+| Column | Meaning |
+|---|---|
+| **Actual** | Number of image files physically inside the archive |
+| **Stored** | `PageCount` field in the embedded ComicInfo.xml |
+| **CV** | Page count from Comic Vine (read from local cache) |
+| **Delta** | Actual − CV (negative = pages possibly missing from scan) |
+
+```
+╭───┬─────────────────────────────────────┬─────┬────────┬────────┬────┬───────╮
+│   │ File                                │ Fmt │ Actual │ Stored │ CV │ Delta │
+├───┼─────────────────────────────────────┼─────┼────────┼────────┼────┼───────┤
+│ ✓ │ Alien (2024) #001 - Bound to E….cbz │ CBZ │     23 │     23 │ 23 │     0 │
+│ ✗ │ Alien (2024) #002 - Bound to E….cbz │ CBZ │     18 │     18 │ 23 │    -5 │
+│ ? │ Alien (2024) #003.cbz               │ CBZ │     21 │      — │  — │     — │
+╰───┴─────────────────────────────────────┴─────┴────────┴────────┴────┴───────╯
+
+3 file(s)   ✓ 1 OK   ✗ 1 mismatch   ? 1 no reference
+```
+
+The CV column is populated from the **local cache** — no API calls are made. Run `comicrelief` on the folder first to fetch and cache metadata, then run `--check-pages` to verify your scans.
+
+> **Note:** CV page counts include ads and letters pages. Scans that skip ads will show a small negative delta (typically −1 to −5) even when otherwise complete.
 
 ### 10. Volume inconsistency detection
 
