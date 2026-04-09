@@ -775,6 +775,8 @@ def extract_cv_metadata(volume: dict, issue: Optional[dict]) -> dict:
 
         # Summary — strip HTML tags from description, normalize whitespace
         desc = issue.get("description", "") or ""
+        # Remove table blocks entirely — CV uses <table> for cover variant lists, not prose
+        desc = re.sub(r"<table\b[^>]*>.*?</table>", "", desc, flags=re.IGNORECASE | re.DOTALL)
         # Block-level elements become paragraph breaks
         desc = re.sub(r"</?(p|div|h[1-6]|ul|ol|li|blockquote|section)\b[^>]*>",
                       "\n\n", desc, flags=re.IGNORECASE)
@@ -1176,10 +1178,8 @@ def fetch_metadata(
             volume = smart_match_volume(candidates, issue_num, cover_bytes, api_key)
 
         if volume is None:
-            # Fall back to the top score-based candidate
+            # Use the top score-based candidate
             volume = candidates[0] if candidates else None
-            if volume is None:
-                volume = search_comicvine_volume(search_name, year, api_key, cache, skip_cache=skip_cache)
 
         if volume:
             vol_id = volume.get("id")
