@@ -461,6 +461,14 @@ def parse_filename(path: Path) -> dict:
     if vol_match:
         result["Volume"] = vol_match.group(1)
 
+    # When a volume number was extracted from the filename but no issue number
+    # was found, treat the volume number as the issue number.  This handles
+    # trade-paperback style releases (e.g. "series_vol2.cbz") where the volume
+    # number IS the entry number in the CV series — without it, no issue-level
+    # metadata would be fetched and every file would rename to the same name.
+    if result.get("Volume") and "Number" not in result:
+        result["Number"] = result["Volume"]
+
     # --- Series name: strip issue/volume/year tokens ---
     series = stem
     # Remove year in parens
@@ -829,12 +837,12 @@ def extract_cv_metadata(volume: dict, issue: Optional[dict], full_metadata: bool
             meta["Number"] = str(num).lstrip("0") or "0"
 
         # Issue title (name in Comic Vine)
-        title = issue.get("name", "").strip()
+        title = (issue.get("name") or "").strip()
         if title:
             meta["Title"] = title
 
         # Cover date → Year + Month
-        cover_date = issue.get("cover_date", "")
+        cover_date = issue.get("cover_date") or ""
         if cover_date:
             parts = cover_date.split("-")
             if len(parts) >= 1 and parts[0]:
@@ -1136,7 +1144,7 @@ def search_gcd(
     target_norm = str(issue_number).lstrip("0") or "0"
 
     def _issue_score(i: dict) -> int:
-        n = str(i.get("number", "")).strip().lstrip("0") or "0"
+        n = str(i.get("number") or "").strip().lstrip("0") or "0"
         return 1 if n == target_norm else 0
 
     issue = max(issues, key=_issue_score)
@@ -1181,9 +1189,9 @@ def search_gcd(
                 # Skip cover-only sequences if there are story sequences
                 for credit in story.get("credits") or []:
                     role_obj = credit.get("role") or {}
-                    role = (role_obj.get("name", "") if isinstance(role_obj, dict) else str(role_obj)).lower()
+                    role = ((role_obj.get("name") or "") if isinstance(role_obj, dict) else str(role_obj)).lower()
                     person_obj = credit.get("person") or {}
-                    name = (person_obj.get("name", "") if isinstance(person_obj, dict) else str(person_obj)).strip()
+                    name = ((person_obj.get("name") or "") if isinstance(person_obj, dict) else str(person_obj)).strip()
                     if not name:
                         continue
                     if "script" in role or "writer" in role:
@@ -1855,7 +1863,11 @@ def fetch_metadata(
 
     Returns (metadata_dict, source_label) or (None, "not found").
     """
-    issue_num = inferred.get("Number")
+    # Use Number if present; fall back to Volume so that files with no explicit
+    # issue number (e.g. "Star Trek New Visions.cbz" with Volume=1 in existing
+    # metadata) still trigger an issue-level CV lookup rather than getting only
+    # volume-level metadata and producing a non-unique filename.
+    issue_num = inferred.get("Number") or inferred.get("Volume") or None
     series = inferred.get("Series", "")
     search_name = slugify_series(series) if series else ""
     year = inferred.get("Year")
