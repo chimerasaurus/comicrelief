@@ -82,6 +82,7 @@ python3 comicrelief.py [OPTIONS] <path>
 | `--no-rename` | Fix embedded metadata only, do not rename files |
 | `--no-cache` | Ignore cached API results and re-fetch from Comic Vine |
 | `--smart-match` | Use cover image comparison to disambiguate series with similar names |
+| `--full-metadata` | Fetch and store all available fields: Genre, Tags, LanguageISO, all characters, summary fallback from volume description |
 | `--api-key KEY` | Comic Vine API key (overrides env var and saved config) |
 | `--cache-file FILE` | Path to JSON cache file (default: `~/.comicrelief_cache.json`) |
 | `--core-fields FIELDS` | Comma-separated fields that must all be present for a ✓ in `--list` mode. Default: `Number,Publisher,Series,Year` |

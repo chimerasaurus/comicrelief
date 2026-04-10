@@ -514,7 +514,7 @@ def search_comicvine_volumes_all(series_name: str, api_key: str) -> list:
         {
             "query": series_name,
             "resources": "volume",
-            "field_list": "id,name,start_year,publisher,count_of_issues",
+            "field_list": "id,name,start_year,publisher,count_of_issues,genres",
             "limit": 15,
         },
         api_key,
@@ -568,7 +568,7 @@ def search_comicvine_volume(series_name: str, year: Optional[str], api_key: str,
         {
             "query": series_name,
             "resources": "volume",
-            "field_list": "id,name,start_year,publisher,count_of_issues,description",
+            "field_list": "id,name,start_year,publisher,count_of_issues,description,genres",
             "limit": 10,
         },
         api_key,
@@ -603,8 +603,9 @@ def fetch_comicvine_issue(volume_id: int, issue_number: str, api_key: str, cache
         {
             "filter": f"volume:{volume_id},issue_number:{normalized}",
             "field_list": (
-                "id,name,issue_number,cover_date,description,page_count,person_credits,"
-                "character_credits,story_arc_credits,volume"
+                "id,name,issue_number,cover_date,description,deck,page_count,"
+                "person_credits,character_credits,location_credits,team_credits,"
+                "story_arc_credits,volume"
             ),
             "limit": 5,
         },
@@ -682,8 +683,29 @@ def _pick_issue(results: list) -> dict:
     return results[int(choice) - 1]
 
 
-def extract_cv_metadata(volume: dict, issue: Optional[dict]) -> dict:
-    """Convert Comic Vine volume + issue dicts into our flat metadata format."""
+def _clean_html(raw: str) -> str:
+    """Strip HTML from a Comic Vine description string and return plain text."""
+    raw = re.sub(r"<table\b[^>]*>.*?</table>", "", raw, flags=re.IGNORECASE | re.DOTALL)
+    raw = re.sub(r"</?(p|div|h[1-6]|ul|ol|li|blockquote|section)\b[^>]*>", "\n\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", "", raw)
+    raw = html.unescape(raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n[ \t]+", "\n", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return raw.strip()
+
+
+def extract_cv_metadata(volume: dict, issue: Optional[dict], full_metadata: bool = False) -> dict:
+    """Convert Comic Vine volume + issue dicts into our flat metadata format.
+
+    When full_metadata is True, additional fields are populated:
+    - LanguageISO (always "en" for Comic Vine data)
+    - Genre (from the volume's genre list)
+    - Tags (from the issue's location and team credits)
+    - Characters cap is removed (all characters included)
+    - Summary falls back to the issue deck, then the volume description
+    """
     meta = {}
 
     # Series from volume
@@ -763,32 +785,51 @@ def extract_cv_metadata(volume: dict, issue: Optional[dict]) -> dict:
         if editors:
             meta["Editor"] = ", ".join(editors)
 
-        # Characters
+        # Characters (capped at 20 normally; unlimited with full_metadata)
         chars = [c.get("name", "") for c in issue.get("character_credits", [])]
         if chars:
-            meta["Characters"] = ", ".join(chars[:20])  # cap at 20
+            meta["Characters"] = ", ".join(chars if full_metadata else chars[:20])
 
         # Story arcs
         arcs = [a.get("name", "") for a in issue.get("story_arc_credits", [])]
         if arcs:
             meta["StoryArc"] = ", ".join(arcs)
 
-        # Summary — strip HTML tags from description, normalize whitespace
-        desc = issue.get("description", "") or ""
-        # Remove table blocks entirely — CV uses <table> for cover variant lists, not prose
-        desc = re.sub(r"<table\b[^>]*>.*?</table>", "", desc, flags=re.IGNORECASE | re.DOTALL)
-        # Block-level elements become paragraph breaks
-        desc = re.sub(r"</?(p|div|h[1-6]|ul|ol|li|blockquote|section)\b[^>]*>",
-                      "\n\n", desc, flags=re.IGNORECASE)
-        desc = re.sub(r"<br\s*/?>", "\n", desc, flags=re.IGNORECASE)  # <br> → newline
-        desc = re.sub(r"<[^>]+>", "", desc)        # strip all remaining tags
-        desc = html.unescape(desc)                  # decode &amp; &lt; &#160; etc.
-        desc = re.sub(r"[ \t]+", " ", desc)         # collapse horizontal whitespace
-        desc = re.sub(r"\n[ \t]+", "\n", desc)      # trim leading space on each line
-        desc = re.sub(r"\n{3,}", "\n\n", desc)      # max two consecutive newlines
-        desc = desc.strip()
+        # Summary — clean HTML description
+        desc = _clean_html(issue.get("description", "") or "")
         if desc:
-            meta["Summary"] = desc[:2000]  # cap length
+            meta["Summary"] = desc[:2000]
+
+        if full_metadata:
+            # Tags: locations + teams from this issue
+            locations = [loc.get("name", "") for loc in issue.get("location_credits", []) if loc.get("name")]
+            teams     = [t.get("name", "")   for t   in issue.get("team_credits", [])     if t.get("name")]
+            tag_items = locations + teams
+            if tag_items:
+                meta["Tags"] = ", ".join(tag_items)
+
+            # Summary fallback 1: issue deck (short tagline)
+            if not meta.get("Summary"):
+                deck = (issue.get("deck") or "").strip()
+                if deck:
+                    meta["Summary"] = html.unescape(deck)
+
+    if full_metadata:
+        # Language — CV is an English-language database
+        meta["LanguageISO"] = "en"
+
+        # Genre from the volume's genre list
+        genres = volume.get("genres") or []
+        if isinstance(genres, list) and genres:
+            genre_names = [g.get("name", "") for g in genres if isinstance(g, dict) and g.get("name")]
+            if genre_names:
+                meta["Genre"] = ", ".join(genre_names)
+
+        # Summary fallback 2: volume description (series overview)
+        if not meta.get("Summary"):
+            vol_desc = _clean_html(volume.get("description", "") or "")
+            if vol_desc:
+                meta["Summary"] = vol_desc[:2000]
 
     return {k: v for k, v in meta.items() if v}
 
@@ -993,7 +1034,7 @@ def _get_cv_candidates(
         {
             "query": series_name,
             "resources": "volume",
-            "field_list": "id,name,start_year,publisher,count_of_issues",
+            "field_list": "id,name,start_year,publisher,count_of_issues,genres",
             "limit": 15,
         },
         api_key,
@@ -1139,6 +1180,7 @@ def fetch_metadata(
     skip_cache: bool = False,
     volume_override: Optional[dict] = None,  # pre-selected Comic Vine volume dict
     cover_bytes: Optional[bytes] = None,      # raw cover image for smart matching
+    full_metadata: bool = False,              # fetch and store all available fields
 ) -> Tuple[Optional[dict], str]:
     """
     Fetch metadata from Comic Vine (primary) or Metron (fallback).
@@ -1156,7 +1198,7 @@ def fetch_metadata(
         issue = None
         if vol_id and issue_num:
             issue = fetch_comicvine_issue(vol_id, issue_num, api_key, cache, skip_cache=skip_cache)
-        meta = extract_cv_metadata(volume_override, issue)
+        meta = extract_cv_metadata(volume_override, issue, full_metadata=full_metadata)
         return meta, "Comic Vine"
 
     series = inferred.get("Series", "")
@@ -1186,7 +1228,7 @@ def fetch_metadata(
             issue = None
             if vol_id and issue_num:
                 issue = fetch_comicvine_issue(vol_id, issue_num, api_key, cache, skip_cache=skip_cache)
-            meta = extract_cv_metadata(volume, issue)
+            meta = extract_cv_metadata(volume, issue, full_metadata=full_metadata)
             source = "Comic Vine (smart match)" if len(candidates) >= 2 and cover_bytes else "Comic Vine"
             return meta, source
 
@@ -1418,6 +1460,7 @@ def process_file(
     no_cache: bool = False,
     auto: bool = False,
     smart_match: bool = False,
+    full_metadata: bool = False,
     changelog: Optional[List] = None,
     volume_overrides: Optional[dict] = None,  # series_key → Comic Vine volume dict
 ) -> str:
@@ -1470,6 +1513,7 @@ def process_file(
             skip_cache=skip_cache,
             volume_override=active_volume,
             cover_bytes=cover_bytes,
+            full_metadata=full_metadata,
         )
         if proposed_meta is None:
             console.print(f"[yellow]Could not find metadata for:[/yellow] {path.name} (series: {inferred.get('Series', '?')})")
@@ -2211,6 +2255,7 @@ def main() -> None:
     parser.add_argument("--no-rename", action="store_true", help="Do not rename files")
     parser.add_argument("--no-cache", action="store_true", help="Ignore cached API results and re-fetch")
     parser.add_argument("--smart-match", action="store_true", help="Use cover image comparison to disambiguate series with similar names (requires Pillow and imagehash)")
+    parser.add_argument("--full-metadata", action="store_true", help="Fetch and store all available metadata fields: Genre, Tags (locations/teams), LanguageISO, all characters (no cap), and a summary fallback from the volume description")
     parser.add_argument("--api-key", help="Comic Vine API key")
     parser.add_argument("--cache-file", default=str(DEFAULT_CACHE_PATH), help="Path to API cache JSON file")
     parser.add_argument(
@@ -2370,6 +2415,7 @@ def main() -> None:
                 no_cache=args.no_cache,
                 auto=is_auto,
                 smart_match=args.smart_match,
+                full_metadata=args.full_metadata,
                 changelog=changelog,
                 volume_overrides=volume_overrides,
             )
