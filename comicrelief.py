@@ -539,6 +539,18 @@ def _score_volume(v: dict, series_name: str, year: Optional[str]) -> int:
         s += 10
     elif series_name.lower() in vname:
         s += 5
+
+    # Space-normalised comparison: handles filenames where words are run together,
+    # e.g. "startrek alienspotlight" → "startrekalienspotlight"
+    #   vs "Star Trek Alien Spotlight" → "startrekalienspotlight"  (exact match!)
+    # Also handles hyphenated/dash-separated titles.
+    q_nospace = re.sub(r"[\s\-_:]+", "", series_name.lower())
+    v_nospace = re.sub(r"[\s\-_:]+", "", vname)
+    if q_nospace and q_nospace == v_nospace:
+        s += 10
+    elif q_nospace and (q_nospace in v_nospace or v_nospace.startswith(q_nospace)):
+        s += 5
+
     if year and v.get("start_year") == year:
         s += 8
     count = v.get("count_of_issues") or 0
@@ -631,11 +643,73 @@ def fetch_comicvine_issue(volume_id: int, issue_number: str, api_key: str, cache
     return issue
 
 
-def _pick_volume(results: list) -> dict:
-    """Show a numbered list of Comic Vine volumes and let the user choose one."""
+def _approx_matches_inferred(vol: dict, inferred: dict) -> bool:
+    """
+    Return True if a Comic Vine volume result approximately matches the
+    metadata inferred from the current file (existing ComicInfo.xml + filename).
+
+    Scoring:
+      +3  space-normalised series name is an exact match
+      +2  space-normalised series name is a substring match (≥6 chars)
+      +2  start year matches inferred Year
+      +2  publisher matches inferred Publisher
+    Threshold ≥ 2 → approximate match.
+    """
+    score = 0
+    _STRIP = re.compile(r"[\s\-_:,.()'\"!?]+")
+
+    # Series name comparison
+    inferred_series = (inferred.get("Series") or "").lower()
+    if inferred_series:
+        q = _STRIP.sub("", inferred_series)
+        v = _STRIP.sub("", (vol.get("name") or "").lower())
+        if q and q == v:
+            score += 3
+        elif q and len(q) >= 6 and (q in v or v.startswith(q)):
+            score += 2
+
+    # Year match
+    inferred_year = inferred.get("Year")
+    if inferred_year and str(vol.get("start_year", "")) == str(inferred_year):
+        score += 2
+
+    # Publisher match (only meaningful if existing metadata already has it)
+    inferred_pub = _STRIP.sub("", (inferred.get("Publisher") or "").lower())
+    vol_pub_obj = vol.get("publisher") or {}
+    vol_pub = _STRIP.sub(
+        "",
+        (vol_pub_obj.get("name", "") if isinstance(vol_pub_obj, dict) else str(vol_pub_obj)).lower(),
+    )
+    if inferred_pub and vol_pub and (inferred_pub in vol_pub or vol_pub in inferred_pub):
+        score += 2
+
+    return score >= 2
+
+
+def _pick_volume(
+    results: list,
+    highlight_count: Optional[int] = None,
+    inferred: Optional[dict] = None,
+) -> dict:
+    """Show a numbered list of Comic Vine volumes and let the user choose one.
+
+    highlight_count  — when set, rows whose issue count matches are highlighted
+                       in green (★) as a likely collection size match.
+    inferred         — when set, rows that approximately match the file's own
+                       metadata are flagged with a red * (metadata hint).
+    """
+    legends = []
+    if highlight_count:
+        legends.append(f"[bold green]★[/bold green] = {highlight_count} issues matches your folder")
+    if inferred:
+        legends.append("[red]*[/red] = series name / year / publisher matches file metadata")
+    if legends:
+        console.print("  [dim]" + "   ".join(legends) + "[/dim]")
+
     console.print(f"\n[yellow]Found {len(results)} series — please choose:[/yellow]")
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
     table.add_column("#",         width=4,  no_wrap=True)
+    table.add_column("",          width=1,  no_wrap=True)   # metadata-match indicator
     table.add_column("Series",    min_width=24, no_wrap=True)
     table.add_column("Start",     width=6,  no_wrap=True)
     table.add_column("Publisher", min_width=14, no_wrap=True)
@@ -645,14 +719,36 @@ def _pick_volume(results: list) -> dict:
     for i, vol in enumerate(results, 1):
         pub = vol.get("publisher") or {}
         pub_name = pub.get("name", "—") if isinstance(pub, dict) else str(pub)
-        table.add_row(
-            str(i),
-            vol.get("name") or "?",
-            str(vol.get("start_year") or "?"),
-            pub_name,
-            str(vol.get("count_of_issues") or "?"),
-            str(vol.get("id", "")),
-        )
+        count = vol.get("count_of_issues")
+        count_str = str(count) if count is not None else "?"
+
+        count_match = highlight_count is not None and count == highlight_count
+        meta_match  = inferred is not None and _approx_matches_inferred(vol, inferred)
+
+        issues_cell = f"[bold green]{count_str} ★[/bold green]" if count_match else count_str
+        meta_cell   = "[red]*[/red]" if meta_match else ""
+
+        if count_match:
+            # Highlight the whole row in green for the count match
+            table.add_row(
+                f"[bold green]{i}[/bold green]",
+                meta_cell,
+                f"[bold green]{vol.get('name') or '?'}[/bold green]",
+                f"[bold green]{vol.get('start_year') or '?'}[/bold green]",
+                f"[bold green]{pub_name}[/bold green]",
+                issues_cell,
+                f"[bold green]{vol.get('id', '')}[/bold green]",
+            )
+        else:
+            table.add_row(
+                str(i),
+                meta_cell,
+                vol.get("name") or "?",
+                str(vol.get("start_year") or "?"),
+                pub_name,
+                issues_cell,
+                str(vol.get("id", "")),
+            )
     console.print(table)
 
     choices = [str(i) for i in range(1, len(results) + 1)]
@@ -795,6 +891,16 @@ def extract_cv_metadata(volume: dict, issue: Optional[dict], full_metadata: bool
         if arcs:
             meta["StoryArc"] = ", ".join(arcs)
 
+        # CV page count — stashed under a private key so process_file can
+        # compare it against the actual archive count without writing it to
+        # ComicInfo.xml (PageCount is always set from the real archive count).
+        cv_pc = issue.get("page_count")
+        if cv_pc is not None:
+            try:
+                meta["_cv_page_count"] = int(cv_pc)
+            except (TypeError, ValueError):
+                pass
+
         # Summary — clean HTML description
         desc = _clean_html(issue.get("description", "") or "")
         if desc:
@@ -929,6 +1035,538 @@ def search_metron(series_name: str, issue_number: Optional[str], year: Optional[
 
 
 # ---------------------------------------------------------------------------
+# GCD (Grand Comics Database) API
+# ---------------------------------------------------------------------------
+
+GCD_BASE_URL = "https://www.comics.org/api"
+GCD_RATE_LIMIT = 0.5  # seconds between requests
+_last_gcd_request = 0.0
+
+
+def _gcd_get(endpoint: str, params: dict) -> Optional[dict]:
+    global _last_gcd_request
+    elapsed = time.time() - _last_gcd_request
+    if elapsed < GCD_RATE_LIMIT:
+        time.sleep(GCD_RATE_LIMIT - elapsed)
+    url = f"{GCD_BASE_URL}/{endpoint}"
+    try:
+        r = requests.get(
+            url,
+            params={**params, "format": "json"},
+            timeout=15,
+            headers={"User-Agent": "comicrelief/1.0"},
+        )
+        _last_gcd_request = time.time()
+        if r.status_code == 200:
+            return r.json()
+    except requests.RequestException:
+        pass
+    return None
+
+
+def search_gcd(
+    series_name: str,
+    issue_number: Optional[str],
+    year: Optional[str],
+    cache: DiskCache,
+) -> Optional[dict]:
+    """Search GCD for a series+issue and return flat metadata dict."""
+    cache_key = f"gcd:{series_name.lower()}:{issue_number or ''}:{year or ''}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # --- 1. Find the best matching series ---
+    data = _gcd_get("series/", {"name": series_name})
+    if not data or not data.get("results"):
+        cache.set(cache_key, None)
+        return None
+
+    results = data["results"]
+
+    def _score_gcd_series(s: dict) -> int:
+        sc = 0
+        sname = (s.get("name") or "").lower()
+        if sname == series_name.lower():
+            sc += 10
+        elif series_name.lower() in sname:
+            sc += 5
+        yr = s.get("year_began")
+        if year and yr and str(yr) == str(year):
+            sc += 8
+        count = s.get("issue_count") or 0
+        if count > 50:
+            sc += 3
+        elif count > 10:
+            sc += 1
+        lang = s.get("language") or {}
+        if isinstance(lang, dict) and lang.get("name", "").lower() in ("english", "en"):
+            sc += 4
+        return sc
+
+    best_series = max(results, key=_score_gcd_series)
+    series_id = best_series.get("id")
+    if not series_id:
+        cache.set(cache_key, None)
+        return None
+
+    pub = best_series.get("publisher") or {}
+    meta: dict = {
+        "Series": best_series.get("name", ""),
+    }
+    if isinstance(pub, dict) and pub.get("name"):
+        meta["Publisher"] = pub["name"]
+    elif isinstance(pub, str) and pub:
+        meta["Publisher"] = pub
+
+    if not issue_number:
+        result = {k: v for k, v in meta.items() if v}
+        cache.set(cache_key, result or None)
+        return result or None
+
+    # --- 2. Find the specific issue ---
+    issue_data = _gcd_get("issue/", {"series": series_id, "number": issue_number})
+    if not issue_data or not issue_data.get("results"):
+        # Return series-level data rather than nothing
+        result = {k: v for k, v in meta.items() if v}
+        cache.set(cache_key, result or None)
+        return result or None
+
+    issues = issue_data["results"]
+    target_norm = str(issue_number).lstrip("0") or "0"
+
+    def _issue_score(i: dict) -> int:
+        n = str(i.get("number", "")).strip().lstrip("0") or "0"
+        return 1 if n == target_norm else 0
+
+    issue = max(issues, key=_issue_score)
+
+    # Publication date
+    pub_date = issue.get("publication_date") or issue.get("on_sale_date") or ""
+    if pub_date:
+        yr_m = re.search(r"\b(\d{4})\b", pub_date)
+        if yr_m:
+            meta["Year"] = yr_m.group(1)
+        month_names = {
+            "january": "1", "february": "2", "march": "3", "april": "4",
+            "may": "5", "june": "6", "july": "7", "august": "8",
+            "september": "9", "october": "10", "november": "11", "december": "12",
+        }
+        mo_m = re.search(
+            r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\b",
+            pub_date,
+            re.IGNORECASE,
+        )
+        if mo_m:
+            meta["Month"] = month_names.get(mo_m.group(1).lower(), "")
+
+    issue_title = (issue.get("title") or "").strip()
+    if issue_title:
+        meta["Title"] = issue_title
+
+    # --- 3. Fetch full issue detail for credits ---
+    issue_id = issue.get("id")
+    if issue_id:
+        detail = _gcd_get(f"issue/{issue_id}/", {})
+        if detail:
+            # story_set contains sequences; each has a credits list
+            story_set = detail.get("story_set") or []
+            writers: List[str] = []
+            pencillers: List[str] = []
+            inkers: List[str] = []
+            colorists: List[str] = []
+            editors: List[str] = []
+
+            for story in story_set:
+                # Skip cover-only sequences if there are story sequences
+                for credit in story.get("credits") or []:
+                    role_obj = credit.get("role") or {}
+                    role = (role_obj.get("name", "") if isinstance(role_obj, dict) else str(role_obj)).lower()
+                    person_obj = credit.get("person") or {}
+                    name = (person_obj.get("name", "") if isinstance(person_obj, dict) else str(person_obj)).strip()
+                    if not name:
+                        continue
+                    if "script" in role or "writer" in role:
+                        writers.append(name)
+                    elif "pencil" in role:
+                        pencillers.append(name)
+                    elif "ink" in role:
+                        inkers.append(name)
+                    elif "color" in role or "colour" in role:
+                        colorists.append(name)
+                    elif "edit" in role:
+                        editors.append(name)
+
+            # Deduplicate while preserving order
+            def _dedup(lst: list) -> list:
+                seen: set = set()
+                return [x for x in lst if not (x in seen or seen.add(x))]  # type: ignore[func-returns-value]
+
+            if writers:
+                meta["Writer"] = ", ".join(_dedup(writers))
+            if pencillers:
+                meta["Penciller"] = ", ".join(_dedup(pencillers))
+            if inkers:
+                meta["Inker"] = ", ".join(_dedup(inkers))
+            if colorists:
+                meta["Colorist"] = ", ".join(_dedup(colorists))
+            if editors:
+                meta["Editor"] = ", ".join(_dedup(editors))
+
+    result = {k: v for k, v in meta.items() if v}
+    cache.set(cache_key, result or None)
+    return result or None
+
+
+# ---------------------------------------------------------------------------
+# MangaDex API (manga-specific)
+# ---------------------------------------------------------------------------
+
+MANGADEX_BASE_URL = "https://api.mangadex.org"
+MANGADEX_RATE_LIMIT = 0.3  # ~3 req/s (well within their 5 req/s limit)
+_last_mangadex_request = 0.0
+
+
+def _mangadex_get(endpoint: str, params: list) -> Optional[dict]:
+    """params should be a list of (key, value) tuples to support repeated keys."""
+    global _last_mangadex_request
+    elapsed = time.time() - _last_mangadex_request
+    if elapsed < MANGADEX_RATE_LIMIT:
+        time.sleep(MANGADEX_RATE_LIMIT - elapsed)
+    url = f"{MANGADEX_BASE_URL}/{endpoint}"
+    try:
+        r = requests.get(
+            url,
+            params=params,
+            timeout=15,
+            headers={"User-Agent": "comicrelief/1.0"},
+        )
+        _last_mangadex_request = time.time()
+        if r.status_code == 200:
+            return r.json()
+    except requests.RequestException:
+        pass
+    return None
+
+
+def search_mangadex(
+    series_name: str,
+    issue_number: Optional[str],
+    year: Optional[str],
+    cache: DiskCache,
+) -> Optional[dict]:
+    """Search MangaDex for a manga series and return flat metadata dict."""
+    cache_key = f"mangadex:{series_name.lower()}:{issue_number or ''}:{year or ''}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = _mangadex_get(
+        "manga",
+        [
+            ("title", series_name),
+            ("includes[]", "author"),
+            ("includes[]", "artist"),
+            ("limit", "5"),
+            ("order[relevance]", "desc"),
+        ],
+    )
+    if not data or not data.get("data"):
+        cache.set(cache_key, None)
+        return None
+
+    results = data["data"]
+    if not results:
+        cache.set(cache_key, None)
+        return None
+
+    def _score_md(m: dict) -> int:
+        attrs = m.get("attributes") or {}
+        sc = 0
+        for t in (attrs.get("title") or {}).values():
+            if t.lower() == series_name.lower():
+                sc += 10
+                break
+            if series_name.lower() in t.lower():
+                sc += 5
+                break
+        if year and str(attrs.get("year") or "") == str(year):
+            sc += 8
+        return sc
+
+    best = max(results, key=_score_md)
+    attrs = best.get("attributes") or {}
+
+    # Prefer English title, fall back to romanised or first available
+    titles = attrs.get("title") or {}
+    title_en = (
+        titles.get("en")
+        or titles.get("ja-ro")
+        or next(iter(titles.values()), "")
+    )
+
+    meta: dict = {}
+    if title_en:
+        meta["Series"] = title_en.strip()
+
+    yr = attrs.get("year")
+    if yr:
+        meta["Year"] = str(yr)
+
+    # Description: English preferred, any language as fallback
+    descs = attrs.get("description") or {}
+    desc_raw = descs.get("en", "") or next(iter(descs.values()), "") if descs else ""
+    if desc_raw:
+        # Strip basic Markdown (MangaDex uses CommonMark)
+        desc_clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", desc_raw)  # links
+        desc_clean = re.sub(r"[*_]{1,2}([^*_]+)[*_]{1,2}", r"\1", desc_clean)  # bold/italic
+        desc_clean = re.sub(r"^#+\s*", "", desc_clean, flags=re.MULTILINE)  # headers
+        desc_clean = re.sub(r"\n{3,}", "\n\n", desc_clean)
+        meta["Summary"] = desc_clean.strip()[:2000]
+
+    # Tags → Genre + Tags
+    genre_tags: List[str] = []
+    content_tags: List[str] = []
+    for tag in (attrs.get("tags") or []):
+        tag_attrs = tag.get("attributes") or {}
+        tag_name = (tag_attrs.get("name") or {}).get("en", "")
+        group = tag_attrs.get("group", "")
+        if not tag_name:
+            continue
+        if group == "genre":
+            genre_tags.append(tag_name)
+        else:
+            content_tags.append(tag_name)
+    if genre_tags:
+        meta["Genre"] = ", ".join(genre_tags)
+    if content_tags:
+        meta["Tags"] = ", ".join(content_tags[:10])
+
+    meta["LanguageISO"] = "ja"
+
+    # Author/Artist from relationships
+    authors: List[str] = []
+    artists: List[str] = []
+    for rel in (best.get("relationships") or []):
+        rel_type = rel.get("type", "")
+        rel_attrs = rel.get("attributes") or {}
+        name = (rel_attrs.get("name") or "").strip()
+        if not name:
+            continue
+        if rel_type == "author":
+            authors.append(name)
+        elif rel_type == "artist":
+            artists.append(name)
+    if authors:
+        meta["Writer"] = ", ".join(authors)
+    if artists:
+        meta["Penciller"] = ", ".join(artists)
+
+    result = {k: v for k, v in meta.items() if v}
+    cache.set(cache_key, result or None)
+    return result or None
+
+
+# ---------------------------------------------------------------------------
+# AniList API (GraphQL, manga series-level)
+# ---------------------------------------------------------------------------
+
+ANILIST_URL = "https://graphql.anilist.co"
+ANILIST_RATE_LIMIT = 2.1  # 30 req/min → 2s apart is comfortably under the limit
+_last_anilist_request = 0.0
+
+_ANILIST_QUERY = """
+query ($search: String) {
+  Media(search: $search, type: MANGA) {
+    title { romaji english native }
+    description(asHtml: false)
+    genres
+    startDate { year }
+    staff(perPage: 6) {
+      edges {
+        role
+        node { name { full } }
+      }
+    }
+  }
+}
+"""
+
+
+def _anilist_post(variables: dict) -> Optional[dict]:
+    global _last_anilist_request
+    elapsed = time.time() - _last_anilist_request
+    if elapsed < ANILIST_RATE_LIMIT:
+        time.sleep(ANILIST_RATE_LIMIT - elapsed)
+    try:
+        r = requests.post(
+            ANILIST_URL,
+            json={"query": _ANILIST_QUERY, "variables": variables},
+            headers={"Content-Type": "application/json", "User-Agent": "comicrelief/1.0"},
+            timeout=15,
+        )
+        _last_anilist_request = time.time()
+        if r.status_code == 200:
+            return r.json()
+    except requests.RequestException:
+        pass
+    return None
+
+
+def search_anilist(series_name: str, cache: DiskCache) -> Optional[dict]:
+    """Search AniList for a manga series and return flat metadata dict (series-level only)."""
+    cache_key = f"anilist:{series_name.lower()}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    data = _anilist_post({"search": series_name})
+    if not data:
+        cache.set(cache_key, None)
+        return None
+
+    media = (data.get("data") or {}).get("Media")
+    if not media:
+        cache.set(cache_key, None)
+        return None
+
+    meta: dict = {}
+
+    # Title: English preferred, romanised as fallback
+    titles = media.get("title") or {}
+    title_en = titles.get("english") or titles.get("romaji") or ""
+    if title_en:
+        meta["Series"] = title_en.strip()
+
+    # Year
+    start = media.get("startDate") or {}
+    if start.get("year"):
+        meta["Year"] = str(start["year"])
+
+    # Description (asHtml: false, but may still have <br> tags)
+    desc = (media.get("description") or "").strip()
+    if desc:
+        desc = re.sub(r"<br\s*/?>", "\n", desc, flags=re.IGNORECASE)
+        desc = re.sub(r"<[^>]+>", "", desc)
+        desc = html.unescape(desc)
+        desc = re.sub(r"\n{3,}", "\n\n", desc).strip()
+        if desc:
+            meta["Summary"] = desc[:2000]
+
+    # Genres
+    genres = media.get("genres") or []
+    if genres:
+        meta["Genre"] = ", ".join(genres)
+
+    # Staff credits
+    staff_edges = (media.get("staff") or {}).get("edges") or []
+    writers: List[str] = []
+    artists: List[str] = []
+    for edge in staff_edges:
+        role = (edge.get("role") or "").lower()
+        node = edge.get("node") or {}
+        name = ((node.get("name") or {}).get("full") or "").strip()
+        if not name:
+            continue
+        if any(kw in role for kw in ("story", "script", "author", "original")):
+            writers.append(name)
+        elif any(kw in role for kw in ("art", "illustrat", "character design", "draw")):
+            artists.append(name)
+    if writers:
+        meta["Writer"] = ", ".join(writers)
+    if artists:
+        meta["Penciller"] = ", ".join(artists)
+
+    result = {k: v for k, v in meta.items() if v}
+    cache.set(cache_key, result or None)
+    return result or None
+
+
+# ---------------------------------------------------------------------------
+# Supplemental metadata merging
+# ---------------------------------------------------------------------------
+
+MANGA_PUBLISHERS: set = {
+    "viz media", "viz", "kodansha", "kodansha comics", "kodansha usa",
+    "yen press", "seven seas entertainment", "seven seas",
+    "dark horse manga", "tokyopop", "del rey manga", "vertical",
+    "square enix manga", "j-novel club", "one peace books",
+    "shueisha", "kadokawa", "hakusensha", "shogakukan",
+}
+
+
+def _is_manga(meta: dict) -> bool:
+    """Detect if a comic is likely manga from publisher or language."""
+    pub = (meta.get("Publisher") or "").lower()
+    if any(mp in pub for mp in MANGA_PUBLISHERS):
+        return True
+    return (meta.get("LanguageISO") or "").lower() in ("ja", "ko", "zh")
+
+
+def _needs_supplement(meta: dict) -> bool:
+    """Return True if key fields are missing that supplemental sources might fill."""
+    return not meta.get("Summary") or not meta.get("Writer")
+
+
+def _merge_metadata(*sources: Optional[dict]) -> dict:
+    """
+    Merge metadata dicts from multiple sources in priority order.
+    For each field, use the first non-empty value across sources.
+    The first source (primary) is never overwritten.
+    """
+    merged: dict = {}
+    for source in sources:
+        if not source:
+            continue
+        for field in METADATA_FIELDS:
+            if field not in merged and source.get(field):
+                merged[field] = source[field]
+    return merged
+
+
+def _supplement_metadata(
+    meta: dict,
+    search_name: str,
+    issue_num: Optional[str],
+    year: Optional[str],
+    full_metadata: bool,
+    cache: DiskCache,
+) -> Tuple[dict, List[str]]:
+    """
+    Try supplemental sources (GCD, MangaDex, AniList) to fill in missing fields.
+    Returns (merged_metadata, list_of_supplemental_source_names_used).
+    """
+    if not _needs_supplement(meta):
+        return meta, []
+
+    is_manga_series = _is_manga(meta)
+    supp_metas: List[Optional[dict]] = []
+    supp_names: List[str] = []
+
+    if is_manga_series:
+        md_meta = search_mangadex(search_name, issue_num, year, cache)
+        if md_meta:
+            supp_metas.append(md_meta)
+            supp_names.append("MangaDex")
+        # Only call AniList if we still need data after MangaDex
+        still_needed = _needs_supplement(_merge_metadata(meta, md_meta) if md_meta else meta)
+        if still_needed:
+            al_meta = search_anilist(search_name, cache)
+            if al_meta:
+                supp_metas.append(al_meta)
+                supp_names.append("AniList")
+    else:
+        gcd_meta = search_gcd(search_name, issue_num, year, cache)
+        if gcd_meta:
+            supp_metas.append(gcd_meta)
+            supp_names.append("GCD")
+
+    if supp_metas:
+        return _merge_metadata(meta, *supp_metas), supp_names
+    return meta, []
+
+
+# ---------------------------------------------------------------------------
 # Smart cover matching (perceptual hash)
 # ---------------------------------------------------------------------------
 
@@ -1044,6 +1682,31 @@ def _get_cv_candidates(
         return []
 
     results = data.get("results", [])
+
+    # If the primary query returned nothing, retry with individual tokens.
+    # Handles filenames like "startrek_alienspotlight" where neither token is a
+    # real word that CV's full-text search can match — but "alienspotlight" as a
+    # query might surface volumes containing "Alien Spotlight", etc.
+    if not results:
+        seen_ids: set = set()
+        tokens = [t for t in series_name.split() if len(t) >= 5]
+        for token in tokens[:3]:   # cap retries to avoid burning rate-limit budget
+            retry_data = _cv_get(
+                COMICVINE_SEARCH_URL,
+                {
+                    "query": token,
+                    "resources": "volume",
+                    "field_list": "id,name,start_year,publisher,count_of_issues,genres",
+                    "limit": 10,
+                },
+                api_key,
+            )
+            for v in (retry_data or {}).get("results", []):
+                vid = v.get("id")
+                if vid and vid not in seen_ids:
+                    results.append(v)
+                    seen_ids.add(vid)
+
     if not results:
         cache.set(cache_key, [])
         return []
@@ -1184,6 +1847,8 @@ def fetch_metadata(
 ) -> Tuple[Optional[dict], str]:
     """
     Fetch metadata from Comic Vine (primary) or Metron (fallback).
+    After the primary source, supplemental sources (GCD / MangaDex / AniList)
+    are queried to fill in any missing Summary or Writer fields.
 
     When cover_bytes is provided and multiple candidate series exist, smart cover
     matching is used to pick the best series match via perceptual hash comparison.
@@ -1191,6 +1856,9 @@ def fetch_metadata(
     Returns (metadata_dict, source_label) or (None, "not found").
     """
     issue_num = inferred.get("Number")
+    series = inferred.get("Series", "")
+    search_name = slugify_series(series) if series else ""
+    year = inferred.get("Year")
 
     # --- Use override volume if provided (user already picked the right series) ---
     if volume_override and api_key:
@@ -1199,14 +1867,15 @@ def fetch_metadata(
         if vol_id and issue_num:
             issue = fetch_comicvine_issue(vol_id, issue_num, api_key, cache, skip_cache=skip_cache)
         meta = extract_cv_metadata(volume_override, issue, full_metadata=full_metadata)
-        return meta, "Comic Vine"
+        if search_name:
+            meta, supp = _supplement_metadata(meta, search_name, issue_num, year, full_metadata, cache)
+            source = "Comic Vine" + (f" + {', '.join(supp)}" if supp else "")
+        else:
+            source = "Comic Vine"
+        return meta, source
 
-    series = inferred.get("Series", "")
     if not series:
         return None, "no series name"
-
-    search_name = slugify_series(series)
-    year = inferred.get("Year")
 
     # --- Comic Vine ---
     if api_key:
@@ -1229,13 +1898,17 @@ def fetch_metadata(
             if vol_id and issue_num:
                 issue = fetch_comicvine_issue(vol_id, issue_num, api_key, cache, skip_cache=skip_cache)
             meta = extract_cv_metadata(volume, issue, full_metadata=full_metadata)
-            source = "Comic Vine (smart match)" if len(candidates) >= 2 and cover_bytes else "Comic Vine"
+            cv_source = "Comic Vine (smart match)" if len(candidates) >= 2 and cover_bytes else "Comic Vine"
+            meta, supp = _supplement_metadata(meta, search_name, issue_num, year, full_metadata, cache)
+            source = cv_source + (f" + {', '.join(supp)}" if supp else "")
             return meta, source
 
     # --- Metron fallback ---
     meta = search_metron(search_name, issue_num, year, cache)
     if meta:
-        return meta, "Metron"
+        meta, supp = _supplement_metadata(meta, search_name, issue_num, year, full_metadata, cache)
+        source = "Metron" + (f" + {', '.join(supp)}" if supp else "")
+        return meta, source
 
     return None, "not found"
 
@@ -1375,11 +2048,22 @@ def show_confirmation_ui(
 # ---------------------------------------------------------------------------
 
 def _safe_filename_part(text: str) -> str:
-    """Strip characters that are unsafe in filenames."""
-    # Remove or replace characters not allowed in most filesystems
-    text = re.sub(r'[\\/*?:"<>|]', "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    """Sanitise a string for use as part of a filename.
+
+    Path separators (/ and \\) are replaced with ' - ' so that crossover
+    titles like "Star Trek/Green Lantern" become "Star Trek - Green Lantern"
+    rather than being silently swallowed or, worse, creating a subdirectory.
+    Other filesystem-unsafe characters are removed outright.
+    """
+    # Replace path separators with a readable dash separator
+    text = re.sub(r"\s*/[/\\]+\s*", " - ", text)   # " / " or "/" → " - "
+    text = re.sub(r"[/\\]", " - ", text)             # any remaining bare slash
+    # Remove characters that are illegal on Windows/macOS/Linux
+    text = re.sub(r'[*?:"<>|]', "", text)
+    # Normalise whitespace and clean up stray dashes left by the replacements
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r" -\s*$", "", text)   # trailing " -" if slash was at end
+    return text.strip()
 
 
 def canonical_filename(metadata: dict, original_path: Path) -> str:
@@ -1397,7 +2081,7 @@ def canonical_filename(metadata: dict, original_path: Path) -> str:
     if not series:
         return original_path.name
 
-    name = series
+    name = _safe_filename_part(series)
     if year:
         name += f" ({year})"
     if number:
@@ -1471,6 +2155,13 @@ def process_file(
     is_cbr = path.suffix.lower() == ".cbr"
     apply_all = False  # set to True when user picks 'a' (apply all remaining)
 
+    # Count sibling comic files — used to highlight matching series in the volume picker
+    _comic_exts = {".cbz", ".cbr"}
+    dir_comic_count: Optional[int] = sum(
+        1 for f in path.parent.iterdir()
+        if f.is_file() and f.suffix.lower() in _comic_exts
+    )
+
     # --- CBR: offer conversion ---
     if is_cbr:
         console.print(f"\n[yellow]CBR file detected:[/yellow] {path.name}")
@@ -1516,14 +2207,101 @@ def process_file(
             full_metadata=full_metadata,
         )
         if proposed_meta is None:
-            console.print(f"[yellow]Could not find metadata for:[/yellow] {path.name} (series: {inferred.get('Series', '?')})")
-            console.print("[dim]Skipping.[/dim]")
-            return "skipped"
+            console.print(
+                f"\n[yellow]Could not find metadata for:[/yellow] {path.name}\n"
+                f"[dim]Inferred series: \"{inferred.get('Series', '?')}\"[/dim]"
+            )
+            if auto:
+                console.print("[dim]Skipping (auto mode).[/dim]")
+                return "skipped"
 
-        # Fill in page count from actual archive
+            # Interactive recovery — offer the same escape hatches as the confirmation UI
+            console.print(
+                "[dim]  s = skip   n = search Comic Vine for a different name"
+                "   i = enter volume ID   q = quit[/dim]"
+            )
+            not_found_choice = Prompt.ask(
+                "", choices=["s", "n", "i", "q"], default="s", show_choices=True
+            )
+            if not_found_choice == "q":
+                return "quit"
+            if not_found_choice == "s":
+                return "skipped"
+            if not_found_choice == "n":
+                if not api_key:
+                    console.print("[yellow]  No Comic Vine API key — cannot search.[/yellow]")
+                    return "skipped"
+                new_name = Prompt.ask("  Search Comic Vine for series").strip()
+                if not new_name:
+                    return "skipped"
+                console.print(f"[dim]Searching Comic Vine for:[/dim] {new_name}")
+                results = search_comicvine_volumes_all(new_name, api_key)
+                if not results:
+                    console.print(f"[yellow]  No results for '{new_name}'.[/yellow]")
+                    return "skipped"
+                new_volume = _pick_volume(results, highlight_count=dir_comic_count, inferred=inferred) if len(results) > 1 else results[0]
+                pub = (new_volume.get("publisher") or {}).get("name", "?")
+                console.print(
+                    f"[green]Using:[/green] {new_volume.get('name')} "
+                    f"({new_volume.get('start_year')}, {pub}, "
+                    f"{new_volume.get('count_of_issues')} issues)"
+                )
+                active_volume = new_volume
+                if volume_overrides is not None:
+                    volume_overrides[series_key] = active_volume
+                skip_cache = True
+                continue   # retry fetch_metadata with the new active_volume
+            if not_found_choice == "i":
+                if not api_key:
+                    console.print("[yellow]  No Comic Vine API key — cannot fetch by ID.[/yellow]")
+                    return "skipped"
+                raw_id = Prompt.ask("  Comic Vine volume ID (numeric, from the URL)").strip()
+                if not raw_id.isdigit():
+                    console.print("[yellow]  Not a valid ID.[/yellow]")
+                    return "skipped"
+                vol_id_input = int(raw_id)
+                console.print(f"[dim]Fetching Comic Vine volume ID {vol_id_input}…[/dim]")
+                new_volume = fetch_comicvine_volume_by_id(vol_id_input, api_key, cache)
+                if not new_volume:
+                    console.print(f"[yellow]  Could not fetch volume ID {vol_id_input}. Check the ID.[/yellow]")
+                    return "skipped"
+                pub = (new_volume.get("publisher") or {}).get("name", "?")
+                console.print(
+                    f"[green]Matched:[/green] {new_volume.get('name')} "
+                    f"({new_volume.get('start_year')}, {pub}, "
+                    f"{new_volume.get('count_of_issues')} issues)"
+                )
+                active_volume = new_volume
+                if volume_overrides is not None:
+                    volume_overrides[series_key] = active_volume
+                skip_cache = True
+                continue   # retry fetch_metadata with the new active_volume
+
+        # Pop the CV page count before it can leak into the archive or the diff UI
+        cv_page_count: Optional[int] = proposed_meta.pop("_cv_page_count", None)
+
+        # Fill in page count from actual archive (always authoritative)
         page_count = get_page_count(path)
         if page_count:
             proposed_meta["PageCount"] = str(page_count)
+
+        # Warn when the actual archive count differs meaningfully from CV's value.
+        # A delta of ±1–4 is normal (ads, letters pages, covers); beyond that
+        # it likely means pages are missing from the scan or the wrong issue matched.
+        if cv_page_count and page_count:
+            delta = page_count - cv_page_count
+            if abs(delta) > 4:
+                if delta < 0:
+                    console.print(
+                        f"[yellow]⚠  Page count mismatch:[/yellow] file has [bold]{page_count}[/bold] pages, "
+                        f"CV reports [bold]{cv_page_count}[/bold] "
+                        f"([red]delta {delta:+d}[/red]) — scan may be missing pages."
+                    )
+                else:
+                    console.print(
+                        f"[dim]ℹ  Page count: file has {page_count} pages, "
+                        f"CV reports {cv_page_count} (delta {delta:+d}).[/dim]"
+                    )
 
         # Preserve fields not returned by API that are already set,
         # except fields where a missing API value is meaningful.
@@ -1560,7 +2338,7 @@ def process_file(
                 if not results:
                     console.print(f"[yellow]No results for '{new_name}'. Try a different name or enter an ID with [i].[/yellow]")
                     continue
-                new_volume = _pick_volume(results) if len(results) > 1 else results[0]
+                new_volume = _pick_volume(results, highlight_count=dir_comic_count, inferred=inferred) if len(results) > 1 else results[0]
                 pub = (new_volume.get("publisher") or {}).get("name", "?")
                 console.print(
                     f"[green]Using:[/green] {new_volume.get('name')} "

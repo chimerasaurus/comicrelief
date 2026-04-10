@@ -4,7 +4,7 @@ An interactive Python script that fixes metadata in digital comic book files (CB
 
 Comic readers like Komga, Kavita, and YACReader rely on embedded metadata to display series names, issue numbers, publication dates, and reading order. If your files have inconsistent, missing, or wrong metadata, comics can appear out of order, grouped into phantom series, or missing covers and descriptions.
 
-`comicrelief` scans a folder (or a single file), looks up the correct metadata from [Comic Vine](https://comicvine.gamespot.com/api/) (with [Metron](https://metron.cloud/) as a fallback), and shows you a before/after comparison before touching anything.
+`comicrelief` scans a folder (or a single file), looks up the correct metadata from [Comic Vine](https://comicvine.gamespot.com/api/) (with [Metron](https://metron.cloud/) as a fallback), and automatically supplements any missing fields from [GCD](https://www.comics.org/) (Western comics), [MangaDex](https://mangadex.org/) (manga), or [AniList](https://anilist.co/) (manga series data). It then shows you a before/after comparison before touching anything.
 
 ---
 
@@ -256,6 +256,22 @@ When searching for a series, results are scored and ranked by:
 - Known English publisher (DC Comics, Marvel, Image, Dark Horse, IDW, etc. score significantly higher to avoid matching foreign reprints)
 
 API results are cached to `~/.comicrelief_cache.json` to avoid redundant requests when running over a large library. Use `--no-cache` to bypass this.
+
+### 3a. Supplemental sources
+
+After the primary lookup, if **Summary** or **Writer** are still missing, the script automatically queries supplemental sources to fill in the gaps:
+
+| Source | Used for | Provides |
+|---|---|---|
+| **[GCD](https://www.comics.org/)** (Grand Comics Database) | Western comics | Credits (writers, pencillers, inkers, colourists, editors), publication dates |
+| **[MangaDex](https://mangadex.org/)** | Manga (detected by publisher) | Descriptions, genres/tags, author/artist credits, language |
+| **[AniList](https://anilist.co/)** | Manga (if MangaDex still incomplete) | Series description, genres, staff credits |
+
+The primary source always wins — supplemental data only fills in fields that are blank. When a supplemental source contributes, its name is appended to the source label shown in the confirmation UI, e.g. `Comic Vine + GCD` or `Metron + MangaDex`.
+
+Manga detection is based on publisher name (Viz, Kodansha, Yen Press, Seven Seas, etc.). No extra flags are needed — supplemental lookups happen automatically.
+
+All three supplemental sources are free and require no API key.
 
 ### 4. Smart cover matching
 
