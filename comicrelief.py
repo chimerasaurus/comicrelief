@@ -400,6 +400,7 @@ def convert_cbr_to_cbz(cbr_path: Path, dry_run: bool = False) -> Optional[Path]:
             for f in image_files + other_files:
                 zf.write(f, f.relative_to(tmp_dir))
 
+        cbr_path.unlink()
         console.print(f"[green]Converted to CBZ:[/green] {cbz_path.name}")
         return cbz_path
 
@@ -2144,6 +2145,10 @@ def find_comics(directory: Path) -> List[Path]:
     for ext in ("*.cbz", "*.CBZ", "*.cbr", "*.CBR"):
         comics.extend(directory.rglob(ext))
     comics.sort()
+    # If both foo.cbr and foo.cbz exist (leftover from a partial conversion),
+    # drop the CBR — the CBZ is the already-converted copy.
+    cbz_stems = {p.parent / p.stem for p in comics if p.suffix.lower() == ".cbz"}
+    comics = [p for p in comics if p.suffix.lower() != ".cbr" or (p.parent / p.stem) not in cbz_stems]
     return comics
 
 
